@@ -511,6 +511,8 @@ impl<E: RNetwork + Spawner + Rng + Clock + Metrics, P: PublicKey> Network<E, P> 
             // Determine if the message should be delivered
             let should_deliver = self.context.gen_bool(link.success_rate);
 
+            println!("queue delivery {} {}", latency.as_millis(), should_deliver);
+
             // Enqueue message for delivery
             let completions = self.transmitter.enqueue(
                 now,
