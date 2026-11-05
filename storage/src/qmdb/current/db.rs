@@ -1151,6 +1151,10 @@ pub(super) async fn compute_grafted_leaves<
     Ok(grafting::graft_chunk_digests::<H, _, N>(strategy, inputs))
 }
 
+/// Maximum number of chunks whose ops-tree nodes [build_grafted_tree] reads at once, bounding the
+/// page buffers held by one read batch.
+const GRAFT_READ_BATCH: usize = 1 << 14;
+
 /// Build a grafted [Mem] from scratch using bitmap chunks and the ops tree.
 ///
 /// For each non-pruned **graftable** chunk (index in `pruned_chunks..graftable_chunks`), reads the
@@ -1190,12 +1194,24 @@ pub(super) async fn build_grafted_tree<
     // Compute grafted leaves for each unpruned graftable chunk. The pending chunk (if any)
     // sits at index `graftable_chunks` and is excluded; its digest is hashed directly into
     // the canonical root.
-    let leaves = compute_grafted_leaves::<F, H, S, N>(
-        ops_tree,
-        (pruned_chunks..graftable_chunks).map(|chunk_idx| (chunk_idx, bitmap.get_chunk(chunk_idx))),
-        strategy,
-    )
-    .await?;
+    //
+    // Chunks are read in bounded batches: each ops-tree node read holds a page buffer until its
+    // batch returns, so reading every chunk at once makes reopening allocate a page per chunk
+    // (gigabytes for databases with billions of operations).
+    let mut leaves = Vec::with_capacity(graftable_chunks - pruned_chunks);
+    let mut start = pruned_chunks;
+    while start < graftable_chunks {
+        let end = (start + GRAFT_READ_BATCH).min(graftable_chunks);
+        leaves.extend(
+            compute_grafted_leaves::<F, H, S, N>(
+                ops_tree,
+                (start..end).map(|chunk_idx| (chunk_idx, bitmap.get_chunk(chunk_idx))),
+                strategy,
+            )
+            .await?,
+        );
+        start = end;
+    }
 
     // Build the base grafted tree: either from pruned components or empty.
     let mut grafted_tree = if pruned_chunks > 0 {
