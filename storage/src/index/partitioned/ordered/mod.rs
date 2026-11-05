@@ -40,11 +40,13 @@
 
 mod cursor;
 mod handle;
+mod occupancy;
 mod partition;
 
 pub use self::cursor::Cursor;
 use self::{
     handle::{CounterHandle, GaugeHandle},
+    occupancy::Occupancy,
     partition::Partition,
 };
 use crate::{
@@ -105,6 +107,9 @@ pub struct Index<T: Translator, V: Send + Sync, const P: usize, G = Gauge, C = C
     /// partition fills, whether from honest growth at low `P` or adversarial grinding.
     spilled: HashMap<usize, BTreeMap<T::Key, Vec<V>>>,
 
+    /// The partitions that may hold keys, so navigation skips empty ones (see [Occupancy]).
+    occupancy: Occupancy,
+
     /// Sorted-array length at which a partition spills to `spilled`; [SPILL_THRESHOLD] in
     /// production, lowered by tests to exercise spilling cheaply.
     threshold: usize,
@@ -142,6 +147,7 @@ impl<T: Translator, V: Send + Sync, const P: usize> Index<T, V, P> {
             translator,
             partitions,
             spilled: HashMap::new(),
+            occupancy: Occupancy::new(count),
             threshold: SPILL_THRESHOLD,
             keys: ctx.gauge("keys", "Number of translated keys in the index"),
             items: ctx.gauge("items", "Number of items in the index"),
@@ -227,6 +233,28 @@ impl<T: Translator, V: Send + Sync, const P: usize, G: GaugeHandle, C: CounterHa
                 .last_key_value()
                 .map(|(_, v)| v.as_slice())
         })
+    }
+
+    /// Values of the smallest key in the first non-empty partition at or above `lo`.
+    fn first_from(&self, lo: usize) -> Option<&[V]> {
+        let mut p = self.occupancy.next_at_or_after(lo)?;
+        loop {
+            if let Some(vals) = self.partition_first(p) {
+                return Some(vals);
+            }
+            p = self.occupancy.next_at_or_after(p + 1)?;
+        }
+    }
+
+    /// Values of the largest key in the last non-empty partition at or below `hi`.
+    fn last_through(&self, hi: usize) -> Option<&[V]> {
+        let mut p = self.occupancy.prev_at_or_before(hi)?;
+        loop {
+            if let Some(vals) = self.partition_last(p) {
+                return Some(vals);
+            }
+            p = self.occupancy.prev_at_or_before(p.checked_sub(1)?)?;
+        }
     }
 
     /// Whether the index currently holds no keys.
@@ -315,6 +343,7 @@ impl<T: Translator, V: Send + Sync, const P: usize, G: GaugeHandle, C: CounterHa
         value: V,
     ) -> Option<Cursor<'_, T::Key, V, G, C>> {
         let k = self.translator.transform(sub);
+        self.occupancy.set(i);
         self.maybe_spill(i);
         if !self.partitions[i].is_empty() {
             let run = self.partitions[i].run_range(&k);
@@ -392,6 +421,7 @@ impl<T: Translator, V: Send + Sync + 'static, const P: usize> Partitioned for In
                 translator: self.translator.clone(),
                 partitions,
                 spilled: HashMap::new(),
+                occupancy: Occupancy::new(count),
                 threshold: self.threshold,
                 keys: Batched::new(&self.keys, WORKER_METRICS_BATCH),
                 items: Batched::new(&self.items, WORKER_METRICS_BATCH),
@@ -421,12 +451,16 @@ impl<T: Translator, V: Send + Sync + 'static, const P: usize> Partitioned for In
                 self.partitions[global].is_empty(),
                 "install target range must be empty"
             );
+            if !partition.is_empty() {
+                self.occupancy.set(global);
+            }
             self.partitions[global] = std::mem::take(partition);
         }
 
         // Drain only the partitions that actually spilled (remapping local -> global), rather than
         // probing every slot in the range.
         for (local, inner) in worker.index.spilled.drain() {
+            self.occupancy.set(lo + local);
             self.spilled.insert(lo + local, inner);
         }
     }
@@ -605,6 +639,7 @@ impl<T: Translator, V: Send + Sync, const P: usize, G: GaugeHandle, C: CounterHa
     fn insert(&mut self, key: &[u8], value: Self::Value) {
         let (i, sub) = partition_index_and_sub_key::<P>(key);
         let k = self.translator.transform(sub);
+        self.occupancy.set(i);
         self.maybe_spill(i);
         if !self.partitions[i].is_empty() {
             let run = self.partitions[i].run_range(&k);
@@ -725,17 +760,10 @@ impl<T: OrderedTranslator, V: Send + Sync, const P: usize, G: GaugeHandle, C: Co
         if let Some(vals) = self.partition_prev_before(i, &k) {
             return Some((vals.iter(), false));
         }
-        for p in (0..i).rev() {
-            if let Some(vals) = self.partition_last(p) {
-                return Some((vals.iter(), false));
-            }
+        if let Some(vals) = i.checked_sub(1).and_then(|hi| self.last_through(hi)) {
+            return Some((vals.iter(), false));
         }
-        for p in (0..self.partitions.len()).rev() {
-            if let Some(vals) = self.partition_last(p) {
-                return Some((vals.iter(), true));
-            }
-        }
-        None
+        self.last_through(usize::MAX).map(|vals| (vals.iter(), true))
     }
 
     fn next_translated_key<'a>(
@@ -754,17 +782,10 @@ impl<T: OrderedTranslator, V: Send + Sync, const P: usize, G: GaugeHandle, C: Co
         if let Some(vals) = self.partition_next_after(i, &k) {
             return Some((vals.iter(), false));
         }
-        for p in i + 1..self.partitions.len() {
-            if let Some(vals) = self.partition_first(p) {
-                return Some((vals.iter(), false));
-            }
+        if let Some(vals) = self.first_from(i + 1) {
+            return Some((vals.iter(), false));
         }
-        for p in 0..self.partitions.len() {
-            if let Some(vals) = self.partition_first(p) {
-                return Some((vals.iter(), true));
-            }
-        }
-        None
+        self.first_from(0).map(|vals| (vals.iter(), true))
     }
 
     fn first_translated_key<'a>(&'a self) -> Option<impl Iterator<Item = &'a V> + Send + 'a> {
@@ -773,13 +794,7 @@ impl<T: OrderedTranslator, V: Send + Sync, const P: usize, G: GaugeHandle, C: Co
             return None;
         }
 
-        // Scan partitions in ascending order for the global first key.
-        for p in 0..self.partitions.len() {
-            if let Some(vals) = self.partition_first(p) {
-                return Some(vals.iter());
-            }
-        }
-        None
+        self.first_from(0).map(|vals| vals.iter())
     }
 
     fn last_translated_key<'a>(&'a self) -> Option<impl Iterator<Item = &'a V> + Send + 'a> {
@@ -788,13 +803,7 @@ impl<T: OrderedTranslator, V: Send + Sync, const P: usize, G: GaugeHandle, C: Co
             return None;
         }
 
-        // Scan partitions in descending order for the global last key.
-        for p in (0..self.partitions.len()).rev() {
-            if let Some(vals) = self.partition_last(p) {
-                return Some(vals.iter());
-            }
-        }
-        None
+        self.last_through(usize::MAX).map(|vals| vals.iter())
     }
 }
 
