@@ -22,6 +22,7 @@ use bytes::{Buf, BufMut};
 use commonware_codec::{Codec, EncodeSize, Read, Write};
 use commonware_cryptography::{Digest, Hasher};
 use commonware_parallel::Strategy;
+use commonware_utils::bitmap::Readable as _;
 use futures::stream::Stream;
 
 /// Proof information for verifying a key has a particular value in the database.
@@ -102,6 +103,58 @@ where
     /// Get the value of `key` in the db, or None if it has no value.
     pub async fn get(&self, key: &K) -> Result<Option<V::Value>, Error<F>> {
         self.any.get(key).await
+    }
+
+    /// Reads what merkleizing a batch that writes `keys` reads from storage, so that the page
+    /// cache serves those reads when the batch merkleizes: each key's committed operation, the
+    /// committed predecessor operation of each key without one, and the ops-tree node that the
+    /// bitmap chunk of each committed operation grafts onto. Discards what it reads.
+    ///
+    /// Only reads committed state, so writes of unapplied batches are not prefetched.
+    pub async fn prefetch(&self, keys: &[K]) -> Result<(), Error<F>> {
+        let bounds = self.any.bounds();
+        let mut ops = Vec::with_capacity(keys.len() * 2);
+        let mut superseded = Vec::with_capacity(keys.len());
+        for key in keys {
+            let start = ops.len();
+            ops.extend(self.any.snapshot.get(key).copied());
+            superseded.extend_from_slice(&ops[start..]);
+            if ops.len() == start
+                && let Some((prev, _)) = self.any.snapshot.prev_translated_key(key)
+            {
+                ops.extend(prev.copied());
+            }
+        }
+        let mut ops: Vec<u64> = ops
+            .into_iter()
+            .filter(|loc| bounds.contains(loc))
+            .map(|loc| *loc)
+            .collect();
+        ops.sort_unstable();
+        ops.dedup();
+
+        // Clearing an operation's activity bit regrafts its chunk onto the ops-tree node at the
+        // grafting height above the chunk.
+        let height = crate::qmdb::current::grafting::height::<N>();
+        let chunk_bits = N as u64 * 8;
+        let pruned = self.any.bitmap.pruned_chunks() as u64;
+        let graftable = *self.grafted_tree.leaves();
+        let mut nodes: Vec<_> = superseded
+            .into_iter()
+            .map(|loc| *loc / chunk_bits)
+            .filter(|chunk| (pruned..graftable).contains(chunk))
+            .map(|chunk| F::subtree_root_position(Location::new(chunk << height), height))
+            .collect();
+        nodes.sort_unstable();
+        nodes.dedup();
+
+        let (read, nodes) = futures::join!(
+            self.any.log.read_many(&ops),
+            crate::merkle::storage::Storage::get_nodes(&self.any.log.merkle, &nodes),
+        );
+        read?;
+        nodes?;
+        Ok(())
     }
 
     /// Return true if the proof authenticates that `key` currently has value `value` in the db with
