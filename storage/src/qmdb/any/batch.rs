@@ -960,6 +960,7 @@ where
         // Floor raise.
         // Steps = user_steps + 1 (+1 for previous commit becoming inactive).
         let total_steps = user_steps + 1;
+        let floor_span = tracing::info_span!("qmdb.floor_raise", steps = total_steps);
         let total_active_keys = self.base_active_keys as isize + active_keys_delta;
         let mut floor = self.base_inactivity_floor_loc;
 
@@ -1183,6 +1184,7 @@ where
         if let Some(job) = diff_sort.take() {
             diff = job.await;
         }
+        drop(floor_span);
 
         // Merge the floor raise's new diff entries as one job on the strategy: nothing below
         // reads `diff` until after the journal merkleization, so the merge overlaps the
@@ -2173,6 +2175,12 @@ where
     {
         let (mut mutations, m) = self.into_parts();
 
+        // Phase spans: each closes when dropped, so its duration covers its phase.
+        let resolve_span = tracing::info_span!(
+            "qmdb.ordered.resolve",
+            mutations = mutations.len() as u64,
+            depth = m.ancestors.len() as u64,
+        );
         // Resolve existing keys.
         let locations = m.gather_existing_locations(&mutations, db, true);
 
@@ -2287,7 +2295,11 @@ where
         prev_locations.sort();
         prev_locations.dedup();
 
+        drop(resolve_span);
+        let prev_span =
+            tracing::info_span!("qmdb.ordered.prev_reads", ops = prev_locations.len() as u64);
         let prev_results = m.read_ops(&prev_locations, &[], &db.log).await?;
+        drop(prev_span);
 
         for (op, &old_loc) in prev_results.into_iter().zip(&prev_locations) {
             let data = match op {
@@ -2324,6 +2336,7 @@ where
         // advances three cursors in a sorted merge instead of three binary searches per key.
         // Active entries are collected and read in one batch below instead of one awaited
         // read per key.
+        let ancestors_span = tracing::info_span!("qmdb.ordered.ancestors");
         let track_shadow = m.ancestors.len() > 1;
         let seen_cap = if track_shadow {
             m.ancestors.iter().map(|a| a.diff.len()).sum()
@@ -2387,6 +2400,8 @@ where
         }
 
         // Sort + dedup candidate sets now so find_next_key/find_prev_key can binary-search.
+        drop(ancestors_span);
+        let build_span = tracing::info_span!("qmdb.ordered.build");
         db.strategy().sort_by(&mut next_candidates, |a, b| a.cmp(b));
         next_candidates.dedup();
         // For `prev_candidates`, duplicates can occur when the same key is pushed from multiple
@@ -2544,19 +2559,24 @@ where
             .filter_map(|(_, entry)| entry.base_old_loc())
             .collect();
 
+        drop(build_span);
         // Remaining phases: floor raise, CommitFloor, journal, diff merge.
-        m.finish(
-            ops,
-            diff,
-            superseded_locs,
-            active_keys_delta,
-            user_steps,
-            metadata,
-            None,
-            fill_candidates,
-            db,
-        )
-        .await
+        let finish_span = tracing::info_span!("qmdb.finish");
+        let result = m
+            .finish(
+                ops,
+                diff,
+                superseded_locs,
+                active_keys_delta,
+                user_steps,
+                metadata,
+                None,
+                fill_candidates,
+                db,
+            )
+            .await;
+        drop(finish_span);
+        result
     }
 }
 

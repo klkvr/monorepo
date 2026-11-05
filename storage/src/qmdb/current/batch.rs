@@ -592,7 +592,10 @@ where
                 |floor, tip, limit, out| fill_candidates(&bitmap_parent, floor, tip, limit, out),
             )
             .await?;
-        compute_current_layer(inner, db, &grafted_parent, &bitmap_parent).await
+        let layer_span = tracing::info_span!("qmdb.current.layer");
+        let result = compute_current_layer(inner, db, &grafted_parent, &bitmap_parent).await;
+        drop(layer_span);
+        result
     }
 }
 
@@ -637,7 +640,10 @@ where
                 |floor, tip, limit, out| fill_candidates(&bitmap_parent, floor, tip, limit, out),
             )
             .await?;
-        compute_current_layer(inner, db, &grafted_parent, &bitmap_parent).await
+        let layer_span = tracing::info_span!("qmdb.current.layer");
+        let result = compute_current_layer(inner, db, &grafted_parent, &bitmap_parent).await;
+        drop(layer_span);
+        result
     }
 }
 
@@ -681,7 +687,10 @@ where
                 |floor, tip, limit, out| fill_candidates(&bitmap_parent, floor, tip, limit, out),
             )
             .await?;
-        compute_current_layer(inner, db, &grafted_parent, &bitmap_parent).await
+        let layer_span = tracing::info_span!("qmdb.current.layer");
+        let result = compute_current_layer(inner, db, &grafted_parent, &bitmap_parent).await;
+        drop(layer_span);
+        result
     }
 }
 
@@ -875,7 +884,9 @@ where
     // MMR build/merkleize as one job through the strategy (against a snapshot of the
     // committed grafted tree). An empty graft set hashes nothing, so it merkleizes without
     // submitting a job.
+    let graft_span = tracing::info_span!("qmdb.current.graft_reads");
     let graft_inputs = read_graft_inputs::<F, _, N>(&ops_tree_adapter, chunks_to_update).await?;
+    drop(graft_span);
     let grafted_batch = if graft_inputs.is_empty() {
         let grafted_hasher = grafting::hasher::<F, H>(grafting_height);
         grafted_parent
