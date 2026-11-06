@@ -15,7 +15,7 @@ use crate::{
         Error,
         any::{
             self, ValueEncoding,
-            batch::{DiffCursors, DiffEntry, Staged as AnyStaged, StagedUpdates},
+            batch::{DiffCursors, DiffEntry, Staged as AnyStaged, StagedLoc, StagedUpdates},
             operation::{Operation, update},
         },
         batch_chain::Bounds,
@@ -583,15 +583,61 @@ where
             grafted_parent,
             bitmap_parent,
         } = self;
-        let (inner, staged_updates) = inner.resolve_updates(updates, upserts, db.any.strategy());
-        let inner = inner
-            .merkleize_with_floor_scan(
-                &db.any,
-                metadata,
-                staged_updates,
-                |floor, tip, limit, out| fill_candidates(&bitmap_parent, floor, tip, limit, out),
-            )
+        // Overlap the update resolution with a committed-prefix candidate prefetch, as the
+        // unordered path does.
+        let (inner, staged_updates, prefetched) = inner
+            .resolve_updates_prefetched(updates, upserts, &db.any, |floor, tip, limit, out| {
+                fill_candidates(&bitmap_parent, floor, tip, limit, out)
+            })
             .await?;
+
+        // The graft step reads the ops-tree node covering every chunk whose bits this batch
+        // changes. The chunks holding the committed locations the staged updates supersede
+        // are known now, and their covering nodes are committed and immutable, so read them
+        // while the operations are built: the graft step then finds them in the page cache.
+        let grafting_height = grafting::height::<N>();
+        let graftable = *db.grafted_tree.leaves() as usize;
+        let pruned = db.any.bitmap.pruned_chunks();
+        let mut chunks: Vec<usize> = staged_updates
+            .iter()
+            .filter_map(|(_, loc, _, _)| match loc {
+                StagedLoc::Committed(loc) => Some(
+                    (**loc / bitmap::Prunable::<N>::CHUNK_SIZE_BITS) as usize,
+                ),
+                StagedLoc::Ancestor { .. } => None,
+            })
+            .filter(|&chunk| chunk >= pruned && chunk < graftable)
+            .collect();
+        chunks.sort_unstable();
+        chunks.dedup();
+        let positions: Vec<Position<F>> = chunks
+            .into_iter()
+            .map(|chunk| {
+                let leaf_start = Location::<F>::new((chunk as u64) << grafting_height);
+                F::subtree_root_position(leaf_start, grafting_height)
+            })
+            .collect();
+        let warm = async {
+            if !positions.is_empty() {
+                let _warm_span = tracing::info_span!(
+                    "qmdb.current.graft_warm",
+                    nodes = positions.len() as u64
+                )
+                .entered();
+                // Only the page cache matters: a failed read fails again in the graft step.
+                let _ = db.any.log.merkle.get_nodes(&positions).await;
+            }
+        };
+        let merkleize = inner.merkleize_with_floor_scan(
+            &db.any,
+            metadata,
+            staged_updates,
+            Some(prefetched),
+            |floor, tip, limit, out| fill_candidates(&bitmap_parent, floor, tip, limit, out),
+        );
+        // The warm read goes first so its misses are in flight before the serial build runs.
+        let ((), inner) = futures::join!(warm, merkleize);
+        let inner = inner?;
         let layer_span = tracing::info_span!("qmdb.current.layer");
         let result = compute_current_layer(inner, db, &grafted_parent, &bitmap_parent).await;
         drop(layer_span);
@@ -684,6 +730,7 @@ where
                 &db.any,
                 metadata,
                 StagedUpdates::<F, update::Ordered<K, V>>::new(),
+                None,
                 |floor, tip, limit, out| fill_candidates(&bitmap_parent, floor, tip, limit, out),
             )
             .await?;

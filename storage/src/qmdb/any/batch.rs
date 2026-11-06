@@ -1663,12 +1663,106 @@ where
         C: Mutable<Item = Operation<F, update::Ordered<K, V>>>,
         I: OrderedIndex<Value = Location<F>>,
     {
-        let (batch, staged_updates) = self.resolve_updates(updates, upserts, db.strategy());
-        batch
-            .merkleize_with_floor_scan(db, metadata, staged_updates, |floor, tip, limit, out| {
+        let (batch, staged_updates, prefetched) = self
+            .resolve_updates_prefetched(updates, upserts, db, |floor, tip, limit, out| {
                 fill_candidates(&db.bitmap, floor, tip, limit, out)
             })
+            .await?;
+        batch
+            .merkleize_with_floor_scan(
+                db,
+                metadata,
+                staged_updates,
+                Some(prefetched),
+                |floor, tip, limit, out| fill_candidates(&db.bitmap, floor, tip, limit, out),
+            )
             .await
+    }
+
+    /// Resolve the caller's updates on the strategy pool while gathering and reading the
+    /// committed prefix of the floor-raise candidates, overlapping the two. Returns the
+    /// resolved batch, the staged updates, and the prefetched candidates to seed
+    /// [`merkleize_with_floor_scan`](UnmerkleizedBatch::merkleize_with_floor_scan) with.
+    ///
+    /// `fill_candidates` must be the same candidate source the subsequent floor raise
+    /// scans, so the prefetched prefix continues seamlessly into the live scan (see
+    /// [`PrefetchedCandidates`]). The gather is clamped to the committed boundary: a
+    /// speculative source (e.g. the current variant's parent bitmap) extends past it, but
+    /// its candidate sequence below the boundary is identical and only committed locations
+    /// are servable by the log read.
+    ///
+    /// On early exhaustion of the committed set bits, sources may hand back either one past
+    /// the last emitted candidate or the committed boundary as the continuation point. Both
+    /// are correct: the skipped span holds no set bits, and the source cannot change during
+    /// the call (commits and prunes take `&mut` on the database).
+    #[allow(clippy::type_complexity)]
+    pub(crate) async fn resolve_updates_prefetched<E, C, I, const N: usize>(
+        self,
+        updates: Vec<(usize, Option<V::Value>)>,
+        upserts: Vec<(K, Option<V::Value>)>,
+        db: &Db<F, E, C, I, H, update::Ordered<K, V>, N, S>,
+        mut fill_candidates: impl FnMut(Location<F>, u64, usize, &mut Vec<Location<F>>) -> Location<F>,
+    ) -> Result<
+        (
+            UnmerkleizedBatch<F, H, update::Ordered<K, V>, S>,
+            StagedUpdates<F, update::Ordered<K, V>>,
+            PrefetchedCandidates<F, update::Ordered<K, V>>,
+        ),
+        crate::qmdb::Error<F>,
+    >
+    where
+        E: Context,
+        C: Contiguous<Item = Operation<F, update::Ordered<K, V>>>,
+        I: UnorderedIndex<Value = Location<F>>,
+    {
+        // Bound the steps the floor raise can take: only emitted ops consume steps, and an
+        // op is emitted per location-resolved update plus per upsert or prior mutation on a
+        // key alive in the committed snapshot. Fresh-key creates never consume a step, so
+        // unresolved update slots and writes missing from the snapshot are excluded (one
+        // in-memory probe per key). The bound is approximate in both directions. Surplus
+        // candidates (a translated-key collision, or a key an ancestor already deleted) are
+        // dropped by the raise once it moves enough ops, and a shortfall (a write resolving
+        // only through an ancestor diff) makes the raise fall back to the live scan when
+        // the prefetched prefix runs out.
+        let resolved_updates = updates
+            .iter()
+            .filter(|(slot, _)| self.resolutions.get(*slot).is_some_and(Option::is_some))
+            .count()
+            .min(self.keys.len());
+        let existing_writes = upserts
+            .iter()
+            .map(|(key, _)| key)
+            .chain(self.batch.mutations.keys())
+            .filter(|&key| db.snapshot.get(key).next().is_some())
+            .count();
+        let steps_bound = resolved_updates + existing_writes + 1;
+
+        // Overlap the serial update resolution with the candidate prefetch: the
+        // committed-prefix candidate set depends only on the base floor, the candidate
+        // source, and the step bound, none of which depend on the resolution. The batch
+        // moves into the job, so its floor is captured first.
+        let scan_from = self.batch.base.inactivity_floor_loc();
+        let resolve_len = updates.len() + upserts.len();
+        let resolve = db.strategy().spawn(resolve_len, move |strategy| {
+            self.resolve_updates(updates, upserts, &strategy)
+        });
+
+        // Gather the committed-prefix candidates and read their operations, sharded, while
+        // the resolution job runs.
+        let committed_tip = bitmap::Readable::<N>::len(&*db.bitmap);
+        let mut locs: Vec<Location<F>> = Vec::with_capacity(steps_bound);
+        let next_scan = fill_candidates(scan_from, committed_tip, steps_bound, &mut locs);
+        let raw: Vec<u64> = locs.iter().map(|loc| **loc).collect();
+        let read = db.log.read_many_sharded(&raw).await;
+
+        // Join the resolution and surface any read failure.
+        let (batch, staged_updates) = resolve.await;
+        let prefetched = PrefetchedCandidates {
+            locs,
+            shards: read?,
+            next_scan,
+        };
+        Ok((batch, staged_updates, prefetched))
     }
 }
 
@@ -2145,6 +2239,7 @@ where
             db,
             metadata,
             StagedUpdates::<F, update::Ordered<K, V>>::new(),
+            None,
             |floor, tip, limit, out| fill_candidates(&db.bitmap, floor, tip, limit, out),
         )
         .await
@@ -2166,6 +2261,7 @@ where
         db: &Db<F, E, C, I, H, update::Ordered<K, V>, N, S>,
         metadata: Option<V::Value>,
         staged_updates: StagedUpdates<F, update::Ordered<K, V>>,
+        prefetched: Option<PrefetchedCandidates<F, update::Ordered<K, V>>>,
         fill_candidates: impl FnMut(Location<F>, u64, usize, &mut Vec<Location<F>>) -> Location<F>,
     ) -> Result<Arc<MerkleizedBatch<F, H::Digest, update::Ordered<K, V>, S>>, crate::qmdb::Error<F>>
     where
@@ -2570,7 +2666,7 @@ where
                 active_keys_delta,
                 user_steps,
                 metadata,
-                None,
+                prefetched,
                 fill_candidates,
                 db,
             )
