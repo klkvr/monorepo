@@ -38,10 +38,10 @@
 //! [`Mem::apply_batch`] to replay uncommitted ancestors without requiring the
 //! ancestor batches to still be alive.
 //!
-//! A `Weak` pointer to the parent is kept for [`MerkleizedBatch::get_node`] lookups
-//! (used during a child's merkleize) and for walking the chain to collect ancestor
-//! batch data. Committed-and-dropped ancestors truncate the `Weak` walk, leaving their
-//! data in the committed [`Mem`]. `ancestor_base_size` records the position before the
+//! [`MerkleizedBatch::get_node`] lookups (used during a child's merkleize) read those
+//! `Arc` refs, tip to root. A `Weak` pointer to the parent is kept for walking the chain
+//! to collect ancestor batch data. Committed-and-dropped ancestors truncate the `Weak`
+//! walk, leaving their data in the committed [`Mem`]. `ancestor_base_size` records the position before the
 //! oldest retained ancestor so the remaining suffix is replayed at the correct offset.
 //!
 //! During [`UnmerkleizedBatch::merkleize`], the parent is held as a strong `Arc`
@@ -602,17 +602,24 @@ impl<F: Family, D: Digest, S: Strategy> MerkleizedBatch<F, D, S> {
             let i = (*pos - *self.parent_size) as usize;
             return self.appended.get(i).copied();
         }
-        // Walk Weak parent chain.
-        let mut current = self.parent.as_ref().and_then(Weak::upgrade);
-        while let Some(batch) = current {
-            if let Some(d) = batch.overwrites.get(&pos) {
+        // Walk the ancestors' data tip to root. Unlike upgrading the `Weak` parent chain,
+        // this touches no shared reference counts, which parallel lookups contend on. Each
+        // ancestor's size is the parent size of the one after it.
+        let mut size = self.parent_size;
+        for (appended, overwrites) in self
+            .ancestor_appended
+            .iter()
+            .zip(&self.ancestor_overwrites)
+            .rev()
+        {
+            if let Some(d) = overwrites.get(&pos) {
                 return Some(*d);
             }
-            if pos >= batch.parent_size {
-                let i = (*pos - *batch.parent_size) as usize;
-                return batch.appended.get(i).copied();
+            let parent_size = Position::new(*size - appended.len() as u64);
+            if pos >= parent_size {
+                return appended.get((*pos - *parent_size) as usize).copied();
             }
-            current = batch.parent.as_ref().and_then(Weak::upgrade);
+            size = parent_size;
         }
         None
     }
