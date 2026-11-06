@@ -13,7 +13,7 @@ use crate::{
             ValueEncoding,
             db::Db,
             operation::{Operation, update},
-            ordered::{find_next_key, find_next_key_ascending, find_prev_key},
+            ordered::{find_next_key, find_next_key_ascending, find_prev_index},
         },
         batch_chain::{self, Bounds, Commitment},
         bitmap::Shared,
@@ -59,7 +59,7 @@ where
     next_scan: Location<F>,
 }
 
-/// Sorted `(key, (value, loc))` vec consulted by `find_prev_key` to find the predecessor
+/// Sorted `(key, (value, loc))` vec consulted by `find_prev_index` to find the predecessor
 /// of a given key during ordered merkleization. The value is `None` for staged-resolved
 /// keys: the predecessor-rewrite loop only reads a value for keys outside this batch's
 /// mutations, and staged-resolved keys are always in `updated`.
@@ -394,6 +394,94 @@ fn resolve_in_ancestors<'a, F: Family, D: Digest, U: update::Update, S: Strategy
         }
     }
     None
+}
+
+/// Resolve `key` against key-sorted ancestor diffs, closest first, like
+/// [`resolve_in_ancestors`] but over borrowed diff slices that can cross threads.
+fn resolve_in_diffs<'a, K: Ord, F: Family, V>(
+    diffs: &[&'a DiffSlice<K, F, V>],
+    key: &K,
+) -> Option<&'a DiffEntry<F, V>> {
+    diffs.iter().find_map(|diff| lookup_sorted(diff, key))
+}
+
+/// Run `f` over contiguous chunks of `items`, serially or sharded across the strategy pool
+/// as its policy decides, returning one output per chunk in order. `f` receives each chunk's
+/// starting index in `items`.
+#[track_caller]
+fn map_chunks<T: Sync, R: Send, S: Strategy>(
+    strategy: &S,
+    items: &[T],
+    f: impl Fn(usize, &[T]) -> R + Send + Sync,
+) -> Vec<R> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    strategy.run(
+        items.len(),
+        || vec![f(0, items)],
+        || {
+            let manual = strategy.manual();
+            let chunk_len = items.len().div_ceil(manual.parallelism()).max(1);
+            let chunks: Vec<_> = items
+                .chunks(chunk_len)
+                .enumerate()
+                .map(|(i, chunk)| (i * chunk_len, chunk))
+                .collect();
+            manual.map_collect_vec(chunks, |(start, chunk)| f(start, chunk))
+        },
+    )
+}
+
+/// Keep the elements of `items` for which `keep` holds, evaluating `keep` on the strategy
+/// pool and compacting in place, preserving order.
+#[track_caller]
+fn par_retain<T: Sync, S: Strategy>(
+    strategy: &S,
+    items: &mut Vec<T>,
+    keep: impl Fn(&T) -> bool + Send + Sync,
+) {
+    let mask: Vec<bool> = map_chunks(strategy, items, |_, chunk| {
+        chunk.iter().map(&keep).collect::<Vec<_>>()
+    })
+    .concat();
+    let mut mask = mask.into_iter();
+    items.retain(|_| mask.next().expect("mask covers every item"));
+}
+
+/// For each op read at the matching location in locs, whether an ancestor diff supersedes its
+/// key at another location (or deletes it). Without ancestor diffs nothing is stale.
+#[track_caller]
+fn stale_mask<F: Family, K: Ord + Sync, V: Sync, T: Sync, S: Strategy>(
+    strategy: &S,
+    diffs: &[&DiffSlice<K, F, V>],
+    ops: &[T],
+    locs: &[Location<F>],
+    key_of: impl Fn(&T) -> &K + Send + Sync,
+) -> Vec<bool> {
+    if diffs.is_empty() {
+        return vec![false; ops.len()];
+    }
+    map_chunks(strategy, ops, |start, chunk| {
+        chunk
+            .iter()
+            .enumerate()
+            .map(|(i, op)| {
+                resolve_in_diffs(diffs, key_of(op)).is_some_and(|e| e.loc() != Some(locs[start + i]))
+            })
+            .collect::<Vec<_>>()
+    })
+    .concat()
+}
+
+/// The key of an ordered Update op; the snapshot only references Update ops.
+fn ordered_key<F: Family, K: Key, V: ValueEncoding>(
+    op: &Operation<F, update::Ordered<K, V>>,
+) -> &K {
+    let Operation::Update(data) = op else {
+        unreachable!("snapshot should only reference Update operations")
+    };
+    &data.key
 }
 
 /// Outcome of classifying one floor-raise candidate against the batch diff, ancestor
@@ -844,7 +932,47 @@ where
             let positions: Vec<u64> = locations.iter().map(|loc| **loc).collect();
             return Ok(reader.read_many_sharded(&positions).await?);
         }
-        Ok(vec![self.read_ops(locations, batch_ops, reader).await?])
+
+        // Mixed shape: resolve the in-memory regions, then read the committed subset sharded.
+        let mut results: Vec<Option<Operation<F, U>>> = locations
+            .iter()
+            .map(|loc| self.try_read_op_from_uncommitted(*loc, batch_ops))
+            .collect();
+        let committed: Vec<(usize, u64)> = results
+            .iter()
+            .zip(locations)
+            .enumerate()
+            .filter_map(|(idx, (resolved, loc))| resolved.is_none().then_some((idx, **loc)))
+            .collect();
+        if !committed.is_empty() {
+            let mut positions: Vec<u64> = committed.iter().map(|(_, loc)| *loc).collect();
+            let presorted = positions.is_sorted_by(|a, b| a < b);
+            if !presorted {
+                positions.sort_unstable();
+                positions.dedup();
+            }
+            let read = reader.read_many_sharded(&positions).await?;
+            if presorted {
+                // One read result per committed slot, in order: move them into place.
+                for ((idx, _), op) in committed.iter().zip(read.into_iter().flatten()) {
+                    results[*idx] = Some(op);
+                }
+            } else {
+                let read: Vec<_> = read.into_iter().flatten().collect();
+                for (idx, loc) in committed {
+                    let result_idx = positions
+                        .binary_search(&loc)
+                        .expect("read result missing for requested location");
+                    results[idx] = Some(read[result_idx].clone());
+                }
+            }
+        }
+        Ok(vec![
+            results
+                .into_iter()
+                .map(|r| r.expect("operation should be resolved"))
+                .collect(),
+        ])
     }
 
     /// Gather existing-key locations for all keys in `mutations`.
@@ -868,39 +996,41 @@ where
         C: Contiguous<Item = Operation<F, U>>,
         I: UnorderedIndex<Value = Location<F>>,
     {
-        // Extra slack (*3/2) avoids re-allocations when index collisions cause more than one
-        // location per key.
-        let mut locations = Vec::with_capacity(mutations.len() * 3 / 2);
-        if self.ancestors.is_empty() {
-            for key in mutations.keys() {
-                locations.extend(db.snapshot.get(key).copied());
-            }
-        } else {
-            let mut ancestors = DiffCursors::new(self.ancestors.iter().map(|a| a.diff.as_slice()));
-            for key in mutations.keys() {
-                match ancestors.resolve(key) {
+        // Each key resolves independently (closest ancestor first, then the committed
+        // snapshot), so the lookups shard across the strategy pool; the result is sorted and
+        // deduplicated below, so chunk order does not matter.
+        let strategy = db.strategy();
+        let keys: Vec<&U::Key> = mutations.keys().collect();
+        let diffs: Vec<_> = self.ancestors.iter().map(|a| a.diff.as_slice()).collect();
+        let snapshot = &db.snapshot;
+        let mut locations = map_chunks(strategy, &keys, |_, chunk| {
+            // Extra slack (*3/2) avoids re-allocations when index collisions cause more than
+            // one location per key.
+            let mut out = Vec::with_capacity(chunk.len() * 3 / 2);
+            for &key in chunk {
+                match resolve_in_diffs(&diffs, key) {
                     Some(DiffEntry::Deleted { .. }) => {
                         // Stale; handled via extract_parent_deleted_creates.
                     }
                     Some(DiffEntry::Active {
                         loc, base_old_loc, ..
                     }) => {
-                        locations.push(*loc);
+                        out.push(*loc);
                         if include_active_collision_siblings {
-                            locations.extend(
-                                db.snapshot
+                            out.extend(
+                                snapshot
                                     .get(key)
                                     .copied()
                                     .filter(move |loc| Some(*loc) != *base_old_loc),
                             );
                         }
                     }
-                    None => {
-                        locations.extend(db.snapshot.get(key).copied());
-                    }
+                    None => out.extend(snapshot.get(key).copied()),
                 }
             }
-        }
+            out
+        })
+        .concat();
         db.strategy().sort_by(&mut locations, |a, b| a.cmp(b));
         locations.dedup();
         locations
@@ -2282,18 +2412,23 @@ where
 
         // Classify mutations into deleted, created, updated. `next_candidates` and
         // `prev_candidates` are built as unsorted `Vec`s here and sorted+deduped once below,
-        // before `find_next_key` / `find_prev_key` binary-search them.
-        let mut next_candidates: Vec<K> = Vec::new();
-        let mut prev_candidates: PrevCandidates<K, F, V::Value> = Vec::new();
+        // before `find_next_key` / `find_prev_index` binary-search them.
+        let strategy = db.strategy();
+        let diffs: Vec<_> = m.ancestors.iter().map(|a| a.diff.as_slice()).collect();
+        let mut next_candidates: Vec<K> = Vec::with_capacity(locations.len() + mutations.len());
+        let mut prev_candidates: PrevCandidates<K, F, V::Value> =
+            Vec::with_capacity(locations.len() + mutations.len());
         let mut deleted: Vec<(K, Location<F>)> = Vec::new();
         let mut updated: Vec<(K, V::Value, Location<F>)> = Vec::new();
 
-        for (op, &old_loc) in m
-            .read_ops(&locations, &[], &db.log)
+        let existing: Vec<_> = m
+            .read_ops_sharded(&locations, &[], &db.log)
             .await?
             .into_iter()
-            .zip(&locations)
-        {
+            .flatten()
+            .collect();
+        let stale = stale_mask(strategy, &diffs, &existing, &locations, ordered_key);
+        for ((op, &old_loc), stale) in existing.into_iter().zip(&locations).zip(stale) {
             let update::Ordered {
                 key,
                 value,
@@ -2311,9 +2446,7 @@ where
             // runs, and feeding its next_key or (key, old_loc) into the candidate sets would
             // steer the predecessor rewrites only on the pending-ancestor path (the
             // applied-ancestor path never reads the superseded op).
-            if let Some(entry) = resolve_in_ancestors(&m.ancestors, &key)
-                && entry.loc() != Some(old_loc)
-            {
+            if stale {
                 continue;
             }
 
@@ -2376,28 +2509,41 @@ where
         db.strategy()
             .sort_by(&mut created, |(a, _, _), (b, _, _)| a.cmp(b));
 
-        // Look up prev_translated_key for created/deleted keys.
-        let mut prev_locations = Vec::new();
-        for key in deleted
+        // Look up prev_translated_key for created/deleted keys, sharded across the pool.
+        let changed: Vec<&K> = deleted
             .iter()
             .map(|(k, _)| k)
             .chain(created.iter().map(|(k, _, _)| k))
-        {
-            let Some((iter, _)) = db.snapshot.prev_translated_key(key) else {
-                continue;
-            };
-            prev_locations.extend(iter.copied());
-        }
-        prev_locations.sort();
+            .collect();
+        let snapshot = &db.snapshot;
+        let mut prev_locations: Vec<Location<F>> = map_chunks(strategy, &changed, |_, chunk| {
+            let mut out = Vec::with_capacity(chunk.len());
+            for &key in chunk {
+                if let Some((iter, _)) = snapshot.prev_translated_key(key) {
+                    out.extend(iter.copied());
+                }
+            }
+            out
+        })
+        .concat();
+        strategy.sort_by(&mut prev_locations, |a, b| a.cmp(b));
         prev_locations.dedup();
 
         drop(resolve_span);
         let prev_span =
             tracing::info_span!("qmdb.ordered.prev_reads", ops = prev_locations.len() as u64);
-        let prev_results = m.read_ops(&prev_locations, &[], &db.log).await?;
+        let prev_results: Vec<_> = m
+            .read_ops_sharded(&prev_locations, &[], &db.log)
+            .await?
+            .into_iter()
+            .flatten()
+            .collect();
+        let prev_stale = stale_mask(strategy, &diffs, &prev_results, &prev_locations, ordered_key);
         drop(prev_span);
 
-        for (op, &old_loc) in prev_results.into_iter().zip(&prev_locations) {
+        next_candidates.reserve(prev_results.len());
+        prev_candidates.reserve(prev_results.len());
+        for ((op, &old_loc), stale) in prev_results.into_iter().zip(&prev_locations).zip(prev_stale) {
             let data = match op {
                 Operation::Update(data) => data,
                 _ => unreachable!("expected update operation"),
@@ -2407,9 +2553,7 @@ where
             // sees only applied state, so a key the ancestor diff supersedes at another
             // location (or deletes) is stale here and must not steer the predecessor search.
             // The ancestor-diff walk below contributes the live version of such keys.
-            if let Some(entry) = resolve_in_ancestors(&m.ancestors, &data.key)
-                && entry.loc() != Some(old_loc)
-            {
+            if stale {
                 continue;
             }
             next_candidates.push(data.next_key);
@@ -2481,9 +2625,10 @@ where
         let ancestor_locs: Vec<Location<F>> =
             ancestor_active.iter().map(|&(_, _, loc)| loc).collect();
         for (op, (key, value, loc)) in m
-            .read_ops(&ancestor_locs, &[], &db.log)
+            .read_ops_sharded(&ancestor_locs, &[], &db.log)
             .await?
             .into_iter()
+            .flatten()
             .zip(ancestor_active)
         {
             let data = match op {
@@ -2495,16 +2640,17 @@ where
             prev_candidates.push((key.clone(), (Some(value.clone()), loc)));
         }
 
-        // Sort + dedup candidate sets now so find_next_key/find_prev_key can binary-search.
+        // Sort + dedup candidate sets now so find_next_key/find_prev_index can binary-search.
         drop(ancestors_span);
         let build_span = tracing::info_span!("qmdb.ordered.build");
-        db.strategy().sort_by(&mut next_candidates, |a, b| a.cmp(b));
+        strategy.sort_by(&mut next_candidates, |a, b| a.cmp(b));
         next_candidates.dedup();
         // For `prev_candidates`, duplicates can occur when the same key is pushed from multiple
         // sources (main scan, prev_results, ancestor walk). Later pushes carry the freshest state
         // (ancestor walk runs last), so dedup keeps the LAST push per key. `dedup_by` retains the
         // first of each consecutive run; swap so the retained slot holds the later push.
-        prev_candidates.sort_by(|a, b| a.0.cmp(&b.0));
+        // The strategy's sort is stable, which the keep-last dedup below relies on.
+        strategy.sort_by(&mut prev_candidates, |a, b| a.0.cmp(&b.0));
         prev_candidates.dedup_by(|a, b| {
             if a.0 == b.0 {
                 std::mem::swap(a, b);
@@ -2523,8 +2669,8 @@ where
                 || (ancestor_deleted.binary_search(k).is_ok()
                     && created.binary_search_by(|(ck, _, _)| ck.cmp(k)).is_err())
         };
-        next_candidates.retain(|k| !is_deleted(k));
-        prev_candidates.retain(|(k, _)| !is_deleted(k));
+        par_retain(strategy, &mut next_candidates, |k| !is_deleted(k));
+        par_retain(strategy, &mut prev_candidates, |(k, _)| !is_deleted(k));
 
         // Generate operations.
         let mut ops: Vec<Operation<F, update::Ordered<K, V>>> =
@@ -2548,104 +2694,134 @@ where
             user_steps += 1;
         }
 
-        // Process updates of existing keys.
-        let mut ancestors = DiffCursors::new(m.ancestors.iter().map(|a| a.diff.as_slice()));
-        let mut next_idx = 0;
-        for (key, value, old_loc) in &updated {
-            let new_loc = m.base_state.size + ops.len() as u64;
-            let next_key = find_next_key_ascending(key, &next_candidates, &mut next_idx);
-            ops.push(Operation::Update(update::Ordered {
-                key: key.clone(),
-                value: value.clone(),
-                next_key,
-            }));
-
-            let base_old_loc = ancestors
-                .resolve(key)
-                .map_or(Some(*old_loc), DiffEntry::base_old_loc);
-
-            diff.push((
-                key.clone(),
-                DiffEntry::Active {
+        // Process updates of existing keys, then creates. Each op's location is fixed by its
+        // index, so ops and diff entries build in parallel chunks and concatenate in order.
+        let base_loc = m.base_state.size + ops.len() as u64;
+        for (chunk_ops, chunk_diff) in map_chunks(strategy, &updated, |start, chunk| {
+            let mut chunk_ops = Vec::with_capacity(chunk.len());
+            let mut chunk_diff = Vec::with_capacity(chunk.len());
+            let mut next_idx = next_candidates.partition_point(|k| *k <= chunk[0].0);
+            for (i, (key, value, old_loc)) in chunk.iter().enumerate() {
+                let next_key = find_next_key_ascending(key, &next_candidates, &mut next_idx);
+                chunk_ops.push(Operation::Update(update::Ordered {
+                    key: key.clone(),
                     value: value.clone(),
-                    loc: new_loc,
-                    base_old_loc,
-                },
-            ));
-            user_steps += 1;
+                    next_key,
+                }));
+                let base_old_loc = resolve_in_diffs(&diffs, key)
+                    .map_or(Some(*old_loc), DiffEntry::base_old_loc);
+                chunk_diff.push((
+                    key.clone(),
+                    DiffEntry::Active {
+                        value: value.clone(),
+                        loc: base_loc + (start + i) as u64,
+                        base_old_loc,
+                    },
+                ));
+            }
+            (chunk_ops, chunk_diff)
+        }) {
+            ops.extend(chunk_ops);
+            diff.extend(chunk_diff);
         }
+        user_steps += updated.len() as u64;
 
-        // Process creates.
-        let mut next_idx = 0;
-        for (key, value, base_old_loc) in &created {
-            let new_loc = m.base_state.size + ops.len() as u64;
-            let next_key = find_next_key_ascending(key, &next_candidates, &mut next_idx);
-            ops.push(Operation::Update(update::Ordered {
-                key: key.clone(),
-                value: value.clone(),
-                next_key,
-            }));
-            diff.push((
-                key.clone(),
-                DiffEntry::Active {
+        let base_loc = m.base_state.size + ops.len() as u64;
+        for (chunk_ops, chunk_diff) in map_chunks(strategy, &created, |start, chunk| {
+            let mut chunk_ops = Vec::with_capacity(chunk.len());
+            let mut chunk_diff = Vec::with_capacity(chunk.len());
+            let mut next_idx = next_candidates.partition_point(|k| *k <= chunk[0].0);
+            for (i, (key, value, base_old_loc)) in chunk.iter().enumerate() {
+                let next_key = find_next_key_ascending(key, &next_candidates, &mut next_idx);
+                chunk_ops.push(Operation::Update(update::Ordered {
+                    key: key.clone(),
                     value: value.clone(),
-                    loc: new_loc,
-                    base_old_loc: *base_old_loc,
-                },
-            ));
-            active_keys_delta += 1;
+                    next_key,
+                }));
+                chunk_diff.push((
+                    key.clone(),
+                    DiffEntry::Active {
+                        value: value.clone(),
+                        loc: base_loc + (start + i) as u64,
+                        base_old_loc: *base_old_loc,
+                    },
+                ));
+            }
+            (chunk_ops, chunk_diff)
+        }) {
+            ops.extend(chunk_ops);
+            diff.extend(chunk_diff);
         }
+        active_keys_delta += created.len() as isize;
 
-        // Update predecessors of created and deleted keys.
+        // Update predecessors of created and deleted keys. The predecessor search runs on the
+        // pool; the first-occurrence dedup stays serial so op locations are deterministic.
         if !prev_candidates.is_empty() {
-            // Safe to use a HashSet here since we don't rely on iteration order.
-            let mut rewritten_predecessors = AHashSet::with_capacity(created.len() + deleted.len());
-            for key in created
+            let changed: Vec<&K> = created
                 .iter()
                 .map(|(k, _, _)| k)
                 .chain(deleted.iter().map(|(k, _)| k))
-            {
-                let (prev_key, (prev_value, prev_loc)) = find_prev_key(key, &prev_candidates);
+                .collect();
+            let preds: Vec<Option<usize>> = map_chunks(strategy, &changed, |_, chunk| {
+                chunk
+                    .iter()
+                    .map(|key| {
+                        let idx = find_prev_index(*key, &prev_candidates);
+                        let prev_key = &prev_candidates[idx].0;
+                        let handled = deleted.binary_search_by(|(k, _)| k.cmp(prev_key)).is_ok()
+                            || updated
+                                .binary_search_by(|(k, _, _)| k.cmp(prev_key))
+                                .is_ok()
+                            || created
+                                .binary_search_by(|(k, _, _)| k.cmp(prev_key))
+                                .is_ok();
+                        (!handled).then_some(idx)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .concat();
 
-                if deleted.binary_search_by(|(k, _)| k.cmp(prev_key)).is_ok()
-                    || updated
-                        .binary_search_by(|(k, _, _)| k.cmp(prev_key))
-                        .is_ok()
-                    || created
-                        .binary_search_by(|(k, _, _)| k.cmp(prev_key))
-                        .is_ok()
-                {
-                    continue;
+            // prev_candidates is deduplicated by key, so an index identifies a predecessor.
+            let mut rewritten = vec![false; prev_candidates.len()];
+            let mut order = Vec::with_capacity(preds.len());
+            for idx in preds.into_iter().flatten() {
+                if !mem::replace(&mut rewritten[idx], true) {
+                    order.push(idx);
                 }
-
-                if !rewritten_predecessors.insert(prev_key.clone()) {
-                    continue;
-                }
-
-                let prev_value = prev_value
-                    .as_ref()
-                    .expect("staged-resolved keys are skipped as updated");
-                let prev_new_loc = m.base_state.size + ops.len() as u64;
-                let prev_next_key = find_next_key(prev_key, &next_candidates);
-                ops.push(Operation::Update(update::Ordered {
-                    key: prev_key.clone(),
-                    value: prev_value.clone(),
-                    next_key: prev_next_key,
-                }));
-
-                let prev_base_old_loc = resolve_in_ancestors(&m.ancestors, prev_key)
-                    .map_or(Some(*prev_loc), DiffEntry::base_old_loc);
-
-                diff.push((
-                    prev_key.clone(),
-                    DiffEntry::Active {
-                        value: prev_value.clone(),
-                        loc: prev_new_loc,
-                        base_old_loc: prev_base_old_loc,
-                    },
-                ));
-                user_steps += 1;
             }
+
+            let base_loc = m.base_state.size + ops.len() as u64;
+            for (chunk_ops, chunk_diff) in map_chunks(strategy, &order, |start, chunk| {
+                let mut chunk_ops = Vec::with_capacity(chunk.len());
+                let mut chunk_diff = Vec::with_capacity(chunk.len());
+                for (i, &idx) in chunk.iter().enumerate() {
+                    let (prev_key, (prev_value, prev_loc)) = &prev_candidates[idx];
+                    let prev_value = prev_value
+                        .as_ref()
+                        .expect("staged-resolved keys are skipped as updated");
+                    let prev_next_key = find_next_key(prev_key, &next_candidates);
+                    chunk_ops.push(Operation::Update(update::Ordered {
+                        key: prev_key.clone(),
+                        value: prev_value.clone(),
+                        next_key: prev_next_key,
+                    }));
+                    let prev_base_old_loc = resolve_in_diffs(&diffs, prev_key)
+                        .map_or(Some(*prev_loc), DiffEntry::base_old_loc);
+                    chunk_diff.push((
+                        prev_key.clone(),
+                        DiffEntry::Active {
+                            value: prev_value.clone(),
+                            loc: base_loc + (start + i) as u64,
+                            base_old_loc: prev_base_old_loc,
+                        },
+                    ));
+                }
+                (chunk_ops, chunk_diff)
+            }) {
+                ops.extend(chunk_ops);
+                diff.extend(chunk_diff);
+            }
+            user_steps += order.len() as u64;
         }
 
         // Committed locations superseded by this batch, for the floor raise (`finish` sorts
@@ -5543,7 +5719,7 @@ mod tests {
     /// child updates a sibling that collides with a parent-deleted key, so the scan pulls
     /// the deleted key's stale committed location into the loop. The guard skips the stale
     /// entry, and it must do so before the candidate pushes: a stale prev-candidate makes
-    /// `find_prev_key`'s wrap-around land on the deleted key, whose rewrite is then skipped
+    /// `find_prev_index`'s wrap-around land on the deleted key, whose rewrite is then skipped
     /// as batch-created, and the true predecessor's rewrite is emitted at a different stream
     /// position than on the committed path, so the roots diverge with identical key-value
     /// data.
