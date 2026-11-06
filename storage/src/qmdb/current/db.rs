@@ -44,7 +44,10 @@ use commonware_utils::{
     sequence::prefixed_u64::U64,
 };
 use core::{num::NonZeroU64, ops::Range};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::Arc,
+};
 use tracing::{error, warn};
 
 /// Prefix used for the metadata key for grafted tree pinned nodes.
@@ -146,6 +149,10 @@ pub struct Db<
     /// otherwise, so a snapshot never observes later mutations.
     pub(super) grafted_tree: Arc<Mem<F, H::Digest>>,
 
+    /// The ops-tree node at the grafting height covering each committed graftable chunk, so
+    /// merkleize grafts a committed chunk without reading the ops tree.
+    pub(super) graft_nodes: GraftNodes<H::Digest>,
+
     /// Persists:
     /// - The number of pruned bitmap chunks at key [PRUNED_CHUNKS_PREFIX]
     /// - The grafted tree pinned nodes at key [NODE_PREFIX]
@@ -166,6 +173,44 @@ pub struct Db<
     /// so tests can drop the pending future at that exact point.
     #[cfg(test)]
     pub(super) halt_before_prune_log: bool,
+}
+
+/// The ops-tree nodes at the grafting height of the chunks `[start, start + nodes.len())`.
+///
+/// A complete chunk's node never changes once the ops tree holds it, so these stay valid until
+/// a rewind, which rebuilds them.
+#[derive(Debug)]
+pub(super) struct GraftNodes<D> {
+    start: usize,
+    nodes: VecDeque<D>,
+}
+
+impl<D: Digest> GraftNodes<D> {
+    pub(super) const fn new(start: usize, nodes: VecDeque<D>) -> Self {
+        Self { start, nodes }
+    }
+
+    /// Returns the node of `chunk`, or `None` when it is outside the held range.
+    pub(super) fn get(&self, chunk: usize) -> Option<D> {
+        chunk
+            .checked_sub(self.start)
+            .and_then(|idx| self.nodes.get(idx).copied())
+    }
+
+    /// The first chunk past the held range.
+    fn end(&self) -> usize {
+        self.start + self.nodes.len()
+    }
+
+    /// Drops the nodes of chunks below `chunk`.
+    fn prune(&mut self, chunk: usize) {
+        if chunk <= self.start {
+            return;
+        }
+        let drop = (chunk - self.start).min(self.nodes.len());
+        self.nodes.drain(..drop);
+        self.start = chunk;
+    }
 }
 
 impl<F, E, C, I, H, U, const N: usize, S> std::fmt::Debug for Db<F, E, C, I, H, U, N, S>
@@ -510,6 +555,7 @@ where
         if pruned_chunks == 0 {
             return Ok(());
         }
+        self.graft_nodes.prune(pruned_chunks as usize);
 
         let prune_loc = Location::<F>::new(pruned_chunks);
         if prune_loc <= self.grafted_tree.bounds().start {
@@ -674,7 +720,7 @@ where
         self.any = self.any.rewind(size).await?;
 
         // Rebuild the grafted tree and canonical root from the rewound `any` state.
-        let (grafted_tree, root) = rebuild_grafted_tree::<F, H, S, N>(
+        let (grafted_tree, graft_nodes, root) = rebuild_grafted_tree::<F, H, S, N>(
             self.any.bitmap.as_ref(),
             &pinned_nodes,
             &self.any.log.merkle,
@@ -685,6 +731,7 @@ where
         .await?;
 
         self.grafted_tree = Arc::new(grafted_tree);
+        self.graft_nodes = graft_nodes;
         self.root = root;
         self.update_metrics();
 
@@ -801,6 +848,23 @@ where
         let range;
         (self.any, range) = self.any.apply_batch(Arc::clone(&batch.inner)).await?;
         Arc::make_mut(&mut self.grafted_tree).apply_batch(&batch.grafted)?;
+
+        // Hold the nodes of the chunks this batch made graftable. The ops tree just appended
+        // them, so they are still in memory or the write buffer.
+        let graftable = *self.grafted_tree.leaves() as usize;
+        let held = self.graft_nodes.end();
+        if graftable > held {
+            let grafting_height = grafting::height::<N>();
+            let positions: Vec<Position<F>> = (held..graftable)
+                .map(|chunk| {
+                    let leaf_start = Location::<F>::new((chunk as u64) << grafting_height);
+                    F::subtree_root_position(leaf_start, grafting_height)
+                })
+                .collect();
+            let nodes = self.any.log.merkle.get_nodes(&positions).await?;
+            self.graft_nodes.nodes.extend(nodes);
+        }
+
         self.root = batch.canonical_root;
         self.update_metrics();
         Ok((self, range))
@@ -1020,14 +1084,14 @@ pub(super) async fn rebuild_grafted_tree<F, H, S, const N: usize>(
     inactivity_floor: Location<F>,
     ops_root: H::Digest,
     strategy: &S,
-) -> Result<(Mem<F, H::Digest>, H::Digest), Error<F>>
+) -> Result<(Mem<F, H::Digest>, GraftNodes<H::Digest>, H::Digest), Error<F>>
 where
     F: merkle::Graftable,
     H: Hasher,
     S: Strategy,
 {
     let ops_leaves = Location::<F>::try_from(ops_tree.size())?;
-    let grafted_tree =
+    let (grafted_tree, graft_nodes) =
         build_grafted_tree::<F, H, S, N>(bitmap, pinned_nodes, ops_tree, ops_leaves, strategy)
             .await?;
     let storage =
@@ -1042,7 +1106,7 @@ where
         &ops_root,
     )
     .await?;
-    Ok((grafted_tree, root))
+    Ok((grafted_tree, graft_nodes, root))
 }
 
 /// Compute the root of the grafted structure represented by `storage`.
@@ -1137,6 +1201,7 @@ pub(super) async fn read_graft_inputs<F: merkle::Graftable, D: Digest, const N: 
 /// identity).
 ///
 /// The provided strategy determines if or how to parallelize merkleization.
+#[cfg(test)]
 pub(super) async fn compute_grafted_leaves<
     F: merkle::Graftable,
     H: Hasher,
@@ -1180,7 +1245,7 @@ pub(super) async fn build_grafted_tree<
     ops_tree: &impl MerkleStorage<F, Digest = H::Digest>,
     ops_leaves: Location<F>,
     strategy: &S,
-) -> Result<Mem<F, H::Digest>, Error<F>> {
+) -> Result<(Mem<F, H::Digest>, GraftNodes<H::Digest>), Error<F>> {
     let grafting_height = grafting::height::<N>();
     let pruned_chunks = bitmap.pruned_chunks();
     let complete_chunks = bitmap.complete_chunks();
@@ -1199,17 +1264,17 @@ pub(super) async fn build_grafted_tree<
     // batch returns, so reading every chunk at once makes reopening allocate a page per chunk
     // (gigabytes for databases with billions of operations).
     let mut leaves = Vec::with_capacity(graftable_chunks - pruned_chunks);
+    let mut nodes = VecDeque::with_capacity(graftable_chunks - pruned_chunks);
     let mut start = pruned_chunks;
     while start < graftable_chunks {
         let end = (start + GRAFT_READ_BATCH).min(graftable_chunks);
-        leaves.extend(
-            compute_grafted_leaves::<F, H, S, N>(
-                ops_tree,
-                (start..end).map(|chunk_idx| (chunk_idx, bitmap.get_chunk(chunk_idx))),
-                strategy,
-            )
-            .await?,
-        );
+        let inputs = read_graft_inputs::<F, _, N>(
+            ops_tree,
+            (start..end).map(|chunk_idx| (chunk_idx, bitmap.get_chunk(chunk_idx))),
+        )
+        .await?;
+        nodes.extend(inputs.iter().map(|&(_, node, _)| node));
+        leaves.extend(grafting::graft_chunk_digests::<H, _, N>(strategy, inputs));
         start = end;
     }
 
@@ -1233,7 +1298,7 @@ pub(super) async fn build_grafted_tree<
         grafted_tree.apply_batch(&batch)?;
     }
 
-    Ok(grafted_tree)
+    Ok((grafted_tree, GraftNodes::new(pruned_chunks, nodes)))
 }
 
 /// Load the metadata and recover the pruning state persisted by previous runs.

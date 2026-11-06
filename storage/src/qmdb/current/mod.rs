@@ -456,7 +456,7 @@ where
     let any = any::init_with_bitmap(context.child("any"), config.into(), Some(bitmap)).await?;
 
     // Rebuild the grafted tree and canonical root from the initialized `any` state.
-    let (grafted_tree, root) = db::rebuild_grafted_tree::<F, H, S, N>(
+    let (grafted_tree, graft_nodes, root) = db::rebuild_grafted_tree::<F, H, S, N>(
         any.bitmap.as_ref(),
         &pinned_nodes,
         &any.log.merkle,
@@ -470,6 +470,7 @@ where
     let db = db::Db {
         any,
         grafted_tree: Arc::new(grafted_tree),
+        graft_nodes,
         metadata,
         strategy,
         root,

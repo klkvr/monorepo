@@ -15,7 +15,7 @@ use crate::{
         Error,
         any::{
             self, ValueEncoding,
-            batch::{DiffCursors, DiffEntry, Staged as AnyStaged, StagedLoc, StagedUpdates},
+            batch::{DiffCursors, DiffEntry, Staged as AnyStaged, StagedUpdates},
             operation::{Operation, update},
         },
         batch_chain::Bounds,
@@ -591,43 +591,6 @@ where
             })
             .await?;
 
-        // The graft step reads the ops-tree node covering every chunk whose bits this batch
-        // changes. The chunks holding the committed locations the staged updates supersede
-        // are known now, and their covering nodes are committed and immutable, so read them
-        // while the operations are built: the graft step then finds them in the page cache.
-        let grafting_height = grafting::height::<N>();
-        let graftable = *db.grafted_tree.leaves() as usize;
-        let pruned = db.any.bitmap.pruned_chunks();
-        let mut chunks: Vec<usize> = staged_updates
-            .iter()
-            .filter_map(|(_, loc, _, _)| match loc {
-                StagedLoc::Committed(loc) => Some(
-                    (**loc / bitmap::Prunable::<N>::CHUNK_SIZE_BITS) as usize,
-                ),
-                StagedLoc::Ancestor { .. } => None,
-            })
-            .filter(|&chunk| chunk >= pruned && chunk < graftable)
-            .collect();
-        chunks.sort_unstable();
-        chunks.dedup();
-        let positions: Vec<Position<F>> = chunks
-            .into_iter()
-            .map(|chunk| {
-                let leaf_start = Location::<F>::new((chunk as u64) << grafting_height);
-                F::subtree_root_position(leaf_start, grafting_height)
-            })
-            .collect();
-        let warm = async {
-            if !positions.is_empty() {
-                let _warm_span = tracing::info_span!(
-                    "qmdb.current.graft_warm",
-                    nodes = positions.len() as u64
-                )
-                .entered();
-                // Only the page cache matters: a failed read fails again in the graft step.
-                let _ = db.any.log.merkle.get_nodes(&positions).await;
-            }
-        };
         let merkleize = inner.merkleize_with_floor_scan(
             &db.any,
             metadata,
@@ -635,9 +598,7 @@ where
             Some(prefetched),
             |floor, tip, limit, out| fill_candidates(&bitmap_parent, floor, tip, limit, out),
         );
-        // The warm read goes first so its misses are in flight before the serial build runs.
-        let ((), inner) = futures::join!(warm, merkleize);
-        let inner = inner?;
+        let inner = merkleize.await?;
         let layer_span = tracing::info_span!("qmdb.current.layer");
         let result = compute_current_layer(inner, db, &grafted_parent, &bitmap_parent).await;
         drop(layer_span);
@@ -932,7 +893,20 @@ where
     // committed grafted tree). An empty graft set hashes nothing, so it merkleizes without
     // submitting a job.
     let graft_span = tracing::info_span!("qmdb.current.graft_reads");
-    let graft_inputs = read_graft_inputs::<F, _, N>(&ops_tree_adapter, chunks_to_update).await?;
+    // Committed chunks take their node from the db; only chunks this batch chain made
+    // graftable read the ops tree.
+    let mut graft_inputs = Vec::new();
+    let mut uncached = Vec::new();
+    for (idx, chunk) in chunks_to_update {
+        match current_db.graft_nodes.get(idx) {
+            Some(node) => graft_inputs.push((idx, node, chunk)),
+            None => uncached.push((idx, chunk)),
+        }
+    }
+    if !uncached.is_empty() {
+        graft_inputs.extend(read_graft_inputs::<F, _, N>(&ops_tree_adapter, uncached).await?);
+        graft_inputs.sort_unstable_by_key(|&(idx, _, _)| idx);
+    }
     drop(graft_span);
     let grafted_batch = if graft_inputs.is_empty() {
         let grafted_hasher = grafting::hasher::<F, H>(grafting_height);
