@@ -49,8 +49,10 @@ impl<K: Key, V: ValueEncoding> UpdateTrait for Update<K, V> {
     const STAGES_DELETES: bool = false;
 
     /// An ordered staged read caches the resolved op's next-key pointer, which an ancestor
-    /// diff entry does not carry, so ancestor resolutions fall back to normal mutations.
+    /// diff entry does not carry, so it is read from the ancestor's operation instead.
     const STAGES_ANCESTORS: Option<K> = None;
+
+    const STAGES_ANCESTORS_BY_READ: bool = true;
 
     fn key(&self) -> &K {
         &self.key

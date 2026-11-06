@@ -35,6 +35,12 @@ pub trait Update: sealed::Sealed + Clone + Send + Sync + 'static {
     /// slots unresolved, so their updates fall back to normal mutations.
     const STAGES_ANCESTORS: Option<Self::Cached>;
 
+    /// Whether a read that resolved in an uncommitted ancestor's diff is staged with the
+    /// payload of the ancestor operation it resolved to, read from the ancestor's in-memory
+    /// journal batch. Used by kinds whose payload an ancestor diff entry does not carry
+    /// ([`STAGES_ANCESTORS`](Self::STAGES_ANCESTORS) is `None`).
+    const STAGES_ANCESTORS_BY_READ: bool = false;
+
     /// The updated key.
     fn key(&self) -> &Self::Key;
 

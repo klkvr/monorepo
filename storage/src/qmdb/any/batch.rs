@@ -2084,24 +2084,49 @@ where
         // write then reuses the resolved location at merkleize instead of falling back to a
         // normal mutation (whose cost -- location gathering, a journal re-read, and
         // per-key ancestor re-resolution -- otherwise grows with ancestor overlap).
+        let mut ancestor_hits = Vec::new();
         let (mut results, unresolved) =
             self.resolve_uncommitted_reads(keys, db.strategy(), |slot, entry| {
-                let Some(cached) = U::STAGES_ANCESTORS else {
-                    return;
-                };
-                if let DiffEntry::Active {
+                let DiffEntry::Active {
                     loc, base_old_loc, ..
                 } = entry
-                {
-                    resolutions[slot] = Some((
-                        StagedLoc::Ancestor {
-                            loc: *loc,
-                            base_old_loc: *base_old_loc,
-                        },
-                        cached,
-                    ));
+                else {
+                    return;
+                };
+                let sloc = StagedLoc::Ancestor {
+                    loc: *loc,
+                    base_old_loc: *base_old_loc,
+                };
+                match U::STAGES_ANCESTORS {
+                    Some(cached) => resolutions[slot] = Some((sloc, cached)),
+                    None if U::STAGES_ANCESTORS_BY_READ => ancestor_hits.push((slot, sloc)),
+                    None => {}
                 }
             });
+
+        // Kinds staging ancestor hits by read take the payload from the resolved ancestor
+        // operation, which lives in that ancestor's in-memory journal batch.
+        if !ancestor_hits.is_empty()
+            && let Some(parent) = self.base.parent()
+        {
+            let mut ancestors = vec![Arc::clone(parent)];
+            ancestors.extend(parent.ancestors());
+            let db_size = *batch_chain::effective_boundary(
+                self.base.db(),
+                ancestors.last().map(|oldest| oldest.bounds.base),
+            )
+            .size;
+            for (slot, sloc) in ancestor_hits {
+                let loc = *sloc.loc();
+                if loc < db_size {
+                    continue;
+                }
+                if let Operation::Update(update) = read_op_from_ancestors(&ancestors, loc, db_size)
+                {
+                    resolutions[slot] = Some((sloc, update.cached()));
+                }
+            }
+        }
         Self::fill_committed_reads(
             unresolved,
             db,
@@ -2475,9 +2500,10 @@ where
         // `Staged::resolve_updates`), so every staged entry carries a value.
         for (key, sloc, old_next, value) in staged_updates {
             let value = value.expect("ordered path never stages deletes");
-            let StagedLoc::Committed(loc) = sloc else {
-                unreachable!("ordered path never stages ancestor resolutions")
-            };
+            // An ancestor-resolved key's base_old_loc is re-resolved from the live ancestor
+            // diffs when its update is emitted, falling back to `loc` once that ancestor has
+            // committed, like the unordered path's staged_base_old_loc.
+            let loc = sloc.loc();
             next_candidates.push(old_next);
             prev_candidates.push((key.clone(), (None, loc)));
             updated.push((key, value, loc));
@@ -4863,6 +4889,110 @@ mod tests {
         "ordered_staged_ancestor_read",
         "ordered_staged_ancestor_write"
     );
+
+    /// Ordered staged reads that resolve in still-alive ancestor diffs (parent and
+    /// grandparent updates and creates) are staged with the ancestor op's next-key, and must
+    /// produce the same root and final state as explicit writes, alongside committed-resolved
+    /// reads, a create, and a delete that rewrite predecessors.
+    #[test]
+    fn ordered_staged_ancestor_reads_match_explicit_writes() {
+        let runner = deterministic::Runner::default();
+        runner.start(|context| async move {
+            type TestDb = OrderedFixedDb<
+                mmr::Family,
+                deterministic::Context,
+                sha256::Digest,
+                sha256::Digest,
+                Sha256,
+                OneCap,
+                Sequential,
+            >;
+
+            let key = |i| colliding_digest(0x84, i);
+            let val = |i| colliding_digest(0x85, i);
+            let read: Vec<u64> = vec![1, 3, 5, 55, 57, 200, 202, 30, 40];
+            let updates: Vec<_> = (0..read.len())
+                .map(|slot| (slot, Some(val(read[slot] + 3_000))))
+                .collect();
+            let upserts = vec![(key(300), Some(val(300))), (key(31), None)];
+            let mut roots = Vec::new();
+
+            for staged_read in [false, true] {
+                let label = if staged_read {
+                    "ordered_staged_alive_read"
+                } else {
+                    "ordered_staged_alive_write"
+                };
+                let context = context.child(label);
+                let config = fixed_db_config::<OneCap>(label, &context);
+                let db = TestDb::init(context, config).await.unwrap();
+
+                let mut seed = db.new_batch();
+                for i in 0..100u64 {
+                    seed = seed.write(key(i), Some(val(i)));
+                }
+                let seed = seed.merkleize(&db, None).await.unwrap();
+                let (db, _) = db.apply_batch(seed).await.unwrap();
+                let db = db.commit().await.unwrap();
+
+                let mut grandparent = db.new_batch();
+                for i in 0..10u64 {
+                    grandparent = grandparent.write(key(i), Some(val(i + 1_000)));
+                }
+                for i in 200..205u64 {
+                    grandparent = grandparent.write(key(i), Some(val(i)));
+                }
+                let grandparent = grandparent.merkleize(&db, None).await.unwrap();
+
+                let mut parent = grandparent.new_batch::<Sha256>();
+                for i in 50..60u64 {
+                    parent = parent.write(key(i), Some(val(i + 2_000)));
+                }
+                parent = parent.write(key(70), None);
+                let parent = parent.merkleize(&db, None).await.unwrap();
+
+                let child = if staged_read {
+                    let read_keys: Vec<_> = read.iter().map(|i| key(*i)).collect();
+                    let keys: Vec<_> = read_keys.iter().collect();
+                    let (_, staged) = parent
+                        .new_batch::<Sha256>()
+                        .stage(&keys, &db)
+                        .await
+                        .unwrap();
+                    staged
+                        .merkleize(updates.clone(), upserts.clone(), None, &db)
+                        .await
+                        .unwrap()
+                } else {
+                    let mut child = parent.new_batch::<Sha256>();
+                    for (slot, value) in &updates {
+                        child = child.write(key(read[*slot]), value.clone());
+                    }
+                    for (k, v) in &upserts {
+                        child = child.write(*k, *v);
+                    }
+                    child.merkleize(&db, None).await.unwrap()
+                };
+                roots.push(child.root());
+
+                let (db, _) = db.apply_batch(grandparent).await.unwrap();
+                let (db, _) = db.apply_batch(parent).await.unwrap();
+                let (db, _) = db.apply_batch(child).await.unwrap();
+                let db = db.commit().await.unwrap();
+                for i in &read {
+                    assert_eq!(db.get(&key(*i)).await.unwrap(), Some(val(i + 3_000)));
+                }
+                assert_eq!(db.get(&key(300)).await.unwrap(), Some(val(300)));
+                assert_eq!(db.get(&key(31)).await.unwrap(), None);
+                assert_eq!(db.get(&key(70)).await.unwrap(), None);
+                roots.push(db.root());
+                db.destroy().await.unwrap();
+            }
+
+            assert_eq!(roots[0], roots[2]);
+            assert_eq!(roots[1], roots[3]);
+        });
+    }
 
     #[test]
     fn read_ops_resolves_committed_ancestor_and_current_sources() {
