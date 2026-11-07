@@ -170,7 +170,7 @@ pub(crate) mod test {
     };
     use commonware_utils::{NZU64, NZUsize, TestRng, probability, sequence::FixedBytes};
     use futures::StreamExt as _;
-    use rand::{Rng, seq::IteratorRandom};
+    use rand::{Rng, RngExt as _, seq::IteratorRandom};
     use std::{
         collections::{BTreeMap, HashMap},
         sync::Arc,
@@ -1870,6 +1870,84 @@ pub(crate) mod test {
         let (db, range) = db.apply_batch(merkleized).await.unwrap();
         let db = db.commit().await.unwrap();
         (db, range)
+    }
+
+
+    /// Random chains of pending batches dense in creates and deletes over a small key space
+    /// reach the same root as committing each batch in turn, so neighbors found through ancestor
+    /// diffs match those of the committed state.
+    async fn batch_random_chains_match_sequential_inner<F: Family>(
+        context: deterministic::Context,
+        seed: u64,
+    ) {
+        let mut rng = TestRng::new(seed);
+        let (ctx_a, ctx_b) = (context.child("a"), context.child("b"));
+        let mut db_a: AnyTestGeneric<F> =
+            crate::qmdb::any::init(ctx_a.child("db"), fixed_db_config::<TwoCap>("rc-a", &ctx_a))
+                .await
+                .unwrap();
+        let mut db_b: AnyTestGeneric<F> =
+            crate::qmdb::any::init(ctx_b.child("db"), fixed_db_config::<TwoCap>("rc-b", &ctx_b))
+                .await
+                .unwrap();
+        for round in 0..40 {
+            let depth = rng.random_range(1..=4);
+            let chain: Vec<Vec<(Digest, Option<Digest>)>> = (0..depth)
+                .map(|_| {
+                    (0..rng.random_range(1..12))
+                        .map(|_| {
+                            let k = key(rng.random_range(0..48));
+                            let v = val(rng.random_range(0..1000));
+                            let v = rng.random_bool(0.6).then_some(v);
+                            (k, v)
+                        })
+                        .collect()
+                })
+                .collect();
+            for writes in &chain {
+                db_a = commit_writes_generic(db_a, writes.clone(), None).await.0;
+            }
+            let mut batch = db_b.new_batch();
+            for (k, v) in &chain[0] {
+                batch = batch.write(*k, *v);
+            }
+            // Batches hold their parents weakly, so the chain keeps every batch alive.
+            let mut batches = vec![batch.merkleize(&db_b, None).await.unwrap()];
+            for writes in &chain[1..] {
+                let mut child = batches.last().unwrap().new_batch::<Sha256>();
+                for (k, v) in writes {
+                    child = child.write(*k, *v);
+                }
+                batches.push(child.merkleize(&db_b, None).await.unwrap());
+            }
+            let merkleized = batches.pop().unwrap();
+            db_b = db_b.apply_batch(merkleized).await.unwrap().0;
+            drop(batches);
+            db_b = db_b.commit().await.unwrap();
+            assert_eq!(db_a.root(), db_b.root(), "round {round}, depth {depth}");
+        }
+        db_a.destroy().await.unwrap();
+        db_b.destroy().await.unwrap();
+    }
+
+    #[test_traced("WARN")]
+    fn test_ordered_fixed_batch_random_chains_match_sequential() {
+        for seed in 0..64 {
+            deterministic::Runner::default().start(|context| {
+                batch_random_chains_match_sequential_inner::<mmr::Family>(context, seed)
+            });
+        }
+    }
+
+    #[test_traced("WARN")]
+    fn test_ordered_fixed_batch_random_chains_match_sequential_mmb() {
+        for seed in 0..64 {
+            deterministic::Runner::default().start(|context| {
+                batch_random_chains_match_sequential_inner::<crate::merkle::mmb::Family>(
+                    context, seed,
+                )
+            });
+        }
     }
 
     // -- Generic inner functions for parameterized batch tests --

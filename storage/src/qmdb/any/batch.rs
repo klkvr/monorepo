@@ -2586,60 +2586,77 @@ where
             prev_candidates.push((data.key, (Some(data.value), old_loc)));
         }
 
-        // Add ancestor-diff keys that may be predecessors or successors of this batch's mutations
-        // but are invisible to the base-DB-only `prev_translated_key` lookup above.
+        // Add ancestor-diff keys that may be predecessors or successors of this batch's created
+        // and deleted keys but are invisible to the base-DB-only `prev_translated_key` lookup
+        // above.
         //
-        // Walk ancestors closest-first; a set tracks keys already seen so each key is processed
-        // only once (closest-ancestor's entry wins). We use AHashSet (keyed per-process via
-        // runtime-rng) instead of std's default SipHash: ahash is DoS-resistant for adversarial
-        // inputs but several times faster on 32-byte Digest keys, where SipHash dominates over
-        // the actual probe.
-        //
-        // Depth-1 chains skip the set entirely — a single ancestor can't shadow itself,
-        // and each diff's keys are unique by construction.
-        //
-        // Each diff is key-sorted, as are `updated`/`created`/`deleted`, so the handled check
-        // advances three cursors in a sorted merge instead of three binary searches per key.
-        // Active entries are collected and read in one batch below instead of one awaited
-        // read per key.
+        // Only the live neighbors of those keys can change an op this batch writes: an updated
+        // key's next key is its fresh op's next key (always a candidate) unless a key between
+        // them is created or deleted here, and predecessor rewrites only touch the neighbors of
+        // created and deleted keys. So each diff is scanned outward from every changed key,
+        // stopping at the first live key on each side, instead of walking every ancestor entry.
+        // A key is live when this batch writes it, or when its closest ancestor entry is active
+        // and this batch does not delete it. A key a closer ancestor holds is left to that
+        // ancestor's scan, which stops at or before it when it is live, so each key contributes
+        // only its newest entry, like a closest-first walk. Deleted keys met on the way are
+        // collected so the candidate sets drop them.
         let ancestors_span = tracing::info_span!("qmdb.ordered.ancestors");
-        let track_shadow = m.ancestors.len() > 1;
-        let seen_cap = if track_shadow {
-            m.ancestors.iter().map(|a| a.diff.len()).sum()
-        } else {
-            0
+        let mut changed_keys: Vec<&K> = deleted
+            .iter()
+            .map(|(k, _)| k)
+            .chain(created.iter().map(|(k, _, _)| k))
+            .collect();
+        changed_keys.sort_unstable();
+        // Whether a key this batch writes is live after it, or `None` for keys it doesn't write.
+        let written = |key: &K| -> Option<bool> {
+            if updated.binary_search_by(|(k, ..)| k.cmp(key)).is_ok()
+                || created.binary_search_by(|(k, ..)| k.cmp(key)).is_ok()
+            {
+                Some(true)
+            } else if deleted.binary_search_by(|(k, _)| k.cmp(key)).is_ok() {
+                Some(false)
+            } else {
+                None
+            }
         };
-        let mut seen: AHashSet<&K> = AHashSet::with_capacity(seen_cap);
+        let mut seen: AHashSet<&K> = AHashSet::new();
         let mut ancestor_deleted: Vec<K> = Vec::new();
         let mut ancestor_active: Vec<(&K, &V::Value, Location<F>)> = Vec::new();
-        for batch in m.ancestors.iter() {
-            let (mut ui, mut ci, mut di) = (0, 0, 0);
-            for (key, entry) in batch.diff.iter() {
-                if track_shadow && !seen.insert(key) {
-                    continue;
+        for (depth, &diff) in diffs.iter().enumerate() {
+            let closer = &diffs[..depth];
+            // Records the entry at index i of the diff a scan meets and returns whether its key
+            // is live, which ends the scan.
+            let mut visit = |i: usize| -> bool {
+                let (key, entry) = &diff[i];
+                if let Some(live) = written(key) {
+                    return live;
                 }
-                // Skip keys already handled by this batch's mutations.
-                while ui < updated.len() && updated[ui].0 < *key {
-                    ui += 1;
+                if let Some(newer) = resolve_in_diffs(closer, key) {
+                    return matches!(newer, DiffEntry::Active { .. });
                 }
-                while ci < created.len() && created[ci].0 < *key {
-                    ci += 1;
-                }
-                while di < deleted.len() && deleted[di].0 < *key {
-                    di += 1;
-                }
-                if updated.get(ui).is_some_and(|(k, ..)| k == key)
-                    || created.get(ci).is_some_and(|(k, ..)| k == key)
-                    || deleted.get(di).is_some_and(|(k, _)| k == key)
-                {
-                    continue;
-                }
-                match entry {
-                    DiffEntry::Active { value, loc, .. } => {
-                        ancestor_active.push((key, value, *loc));
+                if seen.insert(key) {
+                    match entry {
+                        DiffEntry::Active { value, loc, .. } => {
+                            ancestor_active.push((key, value, *loc));
+                        }
+                        DiffEntry::Deleted { .. } => ancestor_deleted.push(key.clone()),
                     }
-                    DiffEntry::Deleted { .. } => {
-                        ancestor_deleted.push(key.clone());
+                }
+                matches!(entry, DiffEntry::Active { .. })
+            };
+            for &changed in &changed_keys {
+                let below = diff.partition_point(|(key, _)| key < changed);
+                let above = below + usize::from(diff.get(below).is_some_and(|(k, _)| k == changed));
+                // Keys form a cycle, the last key's next key being the first, so each scan wraps
+                // around the diff's ends.
+                for i in (0..below).rev().chain((above..diff.len()).rev()) {
+                    if visit(i) {
+                        break;
+                    }
+                }
+                for i in (above..diff.len()).chain(0..below) {
+                    if visit(i) {
+                        break;
                     }
                 }
             }
@@ -4966,7 +4983,7 @@ mod tests {
                 } else {
                     let mut child = parent.new_batch::<Sha256>();
                     for (slot, value) in &updates {
-                        child = child.write(key(read[*slot]), value.clone());
+                        child = child.write(key(read[*slot]), *value);
                     }
                     for (k, v) in &upserts {
                         child = child.write(*k, *v);
