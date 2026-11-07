@@ -59,6 +59,27 @@ where
     next_scan: Location<F>,
 }
 
+impl<F: Family, U: update::Update> PrefetchedCandidates<F, U>
+where
+    Operation<F, U>: Codec,
+{
+    /// Keeps only the first `len` candidates, continuing the scan at the first dropped one.
+    fn truncate(&mut self, len: usize) {
+        if self.locs.len() <= len {
+            return;
+        }
+        self.next_scan = self.locs[len];
+        self.locs.truncate(len);
+        let mut kept = 0;
+        self.shards.retain_mut(|shard| {
+            let keep = len - kept;
+            shard.truncate(keep);
+            kept += shard.len();
+            !shard.is_empty()
+        });
+    }
+}
+
 /// Sorted `(key, (value, loc))` vec consulted by `find_prev_index` to find the predecessor
 /// of a given key during ordered merkleization. The value is `None` for staged-resolved
 /// keys: the predecessor-rewrite loop only reads a value for keys outside this batch's
@@ -299,6 +320,8 @@ where
     batch: UnmerkleizedBatch<F, H, U, S>,
     keys: Vec<U::Key>,
     resolutions: Vec<StagedResolution<F, U>>,
+    /// Floor-raise candidates read ahead by [`prefetch_floor`](Staged::prefetch_floor).
+    floor: Option<PrefetchedCandidates<F, U>>,
 }
 
 /// A speculative batch of operations whose root digest has been computed,
@@ -1489,6 +1512,45 @@ where
         Ok((start..end, values, self))
     }
 
+    /// Reads the operations of the first `target` floor-raise candidates ahead of
+    /// [`merkleize`](Staged::merkleize), which then reads only the candidates it needs past
+    /// them.
+    ///
+    /// Each call continues from the candidates of earlier ones, so callers can grow `target` as
+    /// they stage more keys. `fill_candidates` must be the candidate source `merkleize` uses.
+    /// Only the ordered merkleize consumes these reads.
+    pub(crate) async fn prefetch_floor<E, C, I, const N: usize>(
+        &mut self,
+        target: usize,
+        db: &Db<F, E, C, I, H, U, N, S>,
+        fill_candidates: impl FnOnce(Location<F>, u64, usize, &mut Vec<Location<F>>) -> Location<F>,
+    ) -> Result<(), crate::qmdb::Error<F>>
+    where
+        E: Context,
+        C: Contiguous<Item = Operation<F, U>>,
+        I: UnorderedIndex<Value = Location<F>>,
+    {
+        let base_floor = self.batch.base.inactivity_floor_loc();
+        let floor = self.floor.get_or_insert_with(|| PrefetchedCandidates {
+            locs: Vec::new(),
+            shards: Vec::new(),
+            next_scan: base_floor,
+        });
+        let limit = target.saturating_sub(floor.locs.len());
+        if limit == 0 {
+            return Ok(());
+        }
+        let committed_tip = bitmap::Readable::<N>::len(&*db.bitmap);
+        let mut locs = Vec::with_capacity(limit);
+        let next_scan = fill_candidates(floor.next_scan, committed_tip, limit, &mut locs);
+        let raw: Vec<u64> = locs.iter().map(|loc| **loc).collect();
+        let shards = db.log.read_many_sharded(&raw).await?;
+        floor.locs.extend(locs);
+        floor.shards.extend(shards);
+        floor.next_scan = next_scan;
+        Ok(())
+    }
+
     fn apply_upserts(
         mut batch: UnmerkleizedBatch<F, H, U, S>,
         upserts: Vec<(U::Key, Option<U::Value>)>,
@@ -1531,6 +1593,7 @@ where
             mut batch,
             keys,
             mut resolutions,
+            floor: _,
         } = self;
         let mut staged_updates = StagedUpdates::<F, U>::new();
         if updates.is_empty() {
@@ -1827,7 +1890,7 @@ where
     /// the call (commits and prunes take `&mut` on the database).
     #[allow(clippy::type_complexity)]
     pub(crate) async fn resolve_updates_prefetched<E, C, I, const N: usize>(
-        self,
+        mut self,
         updates: Vec<(usize, Option<V::Value>)>,
         upserts: Vec<(K, Option<V::Value>)>,
         db: &Db<F, E, C, I, H, update::Ordered<K, V>, N, S>,
@@ -1870,8 +1933,9 @@ where
         // Overlap the serial update resolution with the candidate prefetch: the
         // committed-prefix candidate set depends only on the base floor, the candidate
         // source, and the step bound, none of which depend on the resolution. The batch
-        // moves into the job, so its floor is captured first.
+        // moves into the job, so its floor and any staged candidates are taken first.
         let scan_from = self.batch.base.inactivity_floor_loc();
+        let staged_floor = self.floor.take();
         let resolve_len = updates.len() + upserts.len();
         let parent_span = tracing::Span::current();
         let resolve = db.strategy().spawn(resolve_len, move |strategy| {
@@ -1880,26 +1944,40 @@ where
             self.resolve_updates(updates, upserts, &strategy)
         });
 
-        // Gather the committed-prefix candidates and read their operations, sharded, while
-        // the resolution job runs.
-        let prefetch_span =
-            tracing::info_span!("qmdb.staged.floor_prefetch", bound = steps_bound as u64);
-        let committed_tip = bitmap::Readable::<N>::len(&*db.bitmap);
-        let mut locs: Vec<Location<F>> = Vec::with_capacity(steps_bound);
-        let next_scan = fill_candidates(scan_from, committed_tip, steps_bound, &mut locs);
-        let raw: Vec<u64> = locs.iter().map(|loc| **loc).collect();
-        let read = db.log.read_many_sharded(&raw).await;
+        // Gather the committed-prefix candidates past those staged ahead and read their
+        // operations, sharded, while the resolution job runs. Staged candidates beyond the
+        // bound are dropped, so the raise sees exactly the candidates it would have read here.
+        let prefetch_span = tracing::info_span!(
+            "qmdb.staged.floor_prefetch",
+            bound = steps_bound as u64,
+            staged = staged_floor.as_ref().map_or(0, |pf| pf.locs.len()) as u64,
+        );
+        let mut prefetched = staged_floor.unwrap_or_else(|| PrefetchedCandidates {
+            locs: Vec::new(),
+            shards: Vec::new(),
+            next_scan: scan_from,
+        });
+        prefetched.truncate(steps_bound);
+        let mut read = Ok(());
+        if prefetched.locs.len() < steps_bound {
+            let committed_tip = bitmap::Readable::<N>::len(&*db.bitmap);
+            let limit = steps_bound - prefetched.locs.len();
+            let mut locs: Vec<Location<F>> = Vec::with_capacity(limit);
+            let next_scan = fill_candidates(prefetched.next_scan, committed_tip, limit, &mut locs);
+            let raw: Vec<u64> = locs.iter().map(|loc| **loc).collect();
+            read = db.log.read_many_sharded(&raw).await.map(|shards| {
+                prefetched.locs.extend(locs);
+                prefetched.shards.extend(shards);
+                prefetched.next_scan = next_scan;
+            });
+        }
         drop(prefetch_span);
 
         // Join the resolution and surface any read failure.
         let (batch, staged_updates) = resolve
             .instrument(tracing::info_span!("qmdb.staged.resolve_join"))
             .await;
-        let prefetched = PrefetchedCandidates {
-            locs,
-            shards: read?,
-            next_scan,
-        };
+        read?;
         Ok((batch, staged_updates, prefetched))
     }
 }
@@ -2060,6 +2138,7 @@ where
                 batch: self,
                 keys,
                 resolutions,
+                floor: None,
             },
         ))
     }
@@ -4443,6 +4522,7 @@ mod tests {
             batch,
             keys,
             resolutions,
+            floor: None,
         }
     }
 

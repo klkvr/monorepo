@@ -692,6 +692,24 @@ pub mod tests {
                             "expanded root mismatch at depth={depth}"
                         );
 
+                        // Floor candidates staged ahead, grown across expansions and past what
+                        // the raise needs, must not change the root.
+                        let (_, mut staged) =
+                            new_batch().stage(&keys[..split], &db).await.unwrap();
+                        staged.prefetch_floor(1, &db).await.unwrap();
+                        let (_, _, mut staged) = staged.expand(&keys[split..], &db).await.unwrap();
+                        staged.prefetch_floor(2, &db).await.unwrap();
+                        staged.prefetch_floor(256, &db).await.unwrap();
+                        let prefetched_root = staged
+                            .merkleize(indexed_updates.clone(), upserts.clone(), None, &db)
+                            .await
+                            .unwrap()
+                            .root();
+                        assert_eq!(
+                            explicit_root, prefetched_root,
+                            "floor-prefetched root mismatch at depth={depth}"
+                        );
+
                         let planned = val(7_000);
                         let duplicate_update = val(7_001);
                         let (first_values, staged) =

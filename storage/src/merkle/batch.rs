@@ -103,6 +103,52 @@ use core::ops::Range;
 /// Overwritten node digests keyed by position.
 pub(crate) type Overwrites<F, D> = hashbrown::HashMap<Position<F>, D, RandomState>;
 
+/// Each peak of a tree of `size` nodes, with its height and its first leaf.
+fn peak_ranges<F: Family>(size: Position<F>) -> Vec<(Position<F>, u32, Location<F>)> {
+    let mut first_leaf = Location::new(0);
+    F::peaks(size)
+        .map(|(pos, height)| {
+            let peak = (pos, height, first_leaf);
+            first_leaf += 1u64 << height;
+            peak
+        })
+        .collect()
+}
+
+/// Mark the ancestors of the leaf at `loc` as dirty up to its peak, among `peaks` from
+/// [`peak_ranges`].
+///
+/// Walks from peak to leaf (top-down) using [`path::Iterator`], then inserts dirty markers
+/// bottom-up. Bottom-up ordering enables a best-effort early exit: if the node at a given
+/// height matches the most recently pushed entry for that bucket, we stop walking since
+/// the walk that pushed it already marked everything above. This catches consecutive
+/// shared-path walks in O(1); non-consecutive duplicates (a prior walk for a different
+/// subtree landed in the bucket after the shared ancestors) are not detected here and are
+/// collapsed by the per-bucket sort+dedup in `merkleize`.
+fn mark_path_dirty<F: Family>(
+    peaks: &[(Position<F>, u32, Location<F>)],
+    loc: Location<F>,
+    buckets: &mut Vec<Vec<Position<F>>>,
+) {
+    let idx = peaks.partition_point(|&(_, _, first_leaf)| first_leaf <= loc);
+    let Some(&(peak_pos, height, first_leaf)) = idx.checked_sub(1).map(|idx| &peaks[idx]) else {
+        panic!("leaf {loc} not found");
+    };
+    assert!(loc < first_leaf + (1u64 << height), "leaf {loc} not found");
+    let mut buf = [(Position::new(0), Position::new(0), 0u32); path::MAX_PATH_LEN];
+    let mut len = 0;
+    for item in path::Iterator::new(peak_pos, height, first_leaf, loc) {
+        buf[len] = item;
+        len += 1;
+    }
+    for &(parent_pos, _, h) in buf[..len].iter().rev() {
+        if buckets.get(h as usize).and_then(|b| b.last()) == Some(&parent_pos) {
+            break;
+        }
+        push_dirty(buckets, h, parent_pos);
+    }
+}
+
 /// Push a dirty node position into its height bucket, growing the outer Vec as needed.
 fn push_dirty<F: Family>(buckets: &mut Vec<Vec<Position<F>>>, height: u32, pos: Position<F>) {
     let h = height as usize;
@@ -209,31 +255,8 @@ impl<F: Family, D: Digest, S: Strategy> UnmerkleizedBatch<F, D, S> {
     /// subtree landed in the bucket after the shared ancestors) are not detected here and are
     /// collapsed by the per-bucket sort+dedup in `merkleize`.
     fn mark_dirty(&mut self, loc: Location<F>) {
-        let mut first_leaf = Location::new(0);
-        for (peak_pos, height) in F::peaks(self.size()) {
-            let leaves_in_peak = 1u64 << height;
-            if loc >= first_leaf + leaves_in_peak {
-                first_leaf += leaves_in_peak;
-                continue;
-            }
-
-            let mut buf = [(Position::new(0), Position::new(0), 0u32); path::MAX_PATH_LEN];
-            let mut len = 0;
-            for item in path::Iterator::new(peak_pos, height, first_leaf, loc) {
-                buf[len] = item;
-                len += 1;
-            }
-            for &(parent_pos, _, h) in buf[..len].iter().rev() {
-                let h_idx = h as usize;
-                if self.dirty_nodes.get(h_idx).and_then(|b| b.last()) == Some(&parent_pos) {
-                    break;
-                }
-                push_dirty(&mut self.dirty_nodes, h, parent_pos);
-            }
-            return;
-        }
-
-        panic!("leaf {loc} not found (size: {})", self.size());
+        let peaks = peak_ranges(self.size());
+        mark_path_dirty(&peaks, loc, &mut self.dirty_nodes);
     }
 
     /// Add a pre-computed leaf digest.
@@ -351,6 +374,54 @@ impl<F: Family, D: Digest, S: Strategy> UnmerkleizedBatch<F, D, S> {
         let pos = self.validate_loc(loc)?;
         self.store_node(pos, digest);
         self.mark_dirty(loc);
+        Ok(self)
+    }
+
+    /// Update the leaves at `updates`' locations to their digests, like
+    /// [`update_leaf_digest`](Self::update_leaf_digest) for each, finding the nodes they dirty
+    /// on the batch's strategy.
+    ///
+    /// Ascending locations dirty the fewest duplicate nodes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::LeafOutOfBounds`] or [`Error::ElementPruned`] for the first location
+    /// [`update_leaf_digest`](Self::update_leaf_digest) would reject, updating nothing.
+    pub fn update_leaf_digests(mut self, updates: &[(Location<F>, D)]) -> Result<Self, Error<F>> {
+        let (leaves, pruned) = (self.leaves(), self.parent.pruning_boundary());
+        for &(loc, _) in updates {
+            if loc >= leaves {
+                return Err(Error::LeafOutOfBounds(loc));
+            }
+            if loc < pruned {
+                return Err(Error::ElementPruned(Position::try_from(loc)?));
+            }
+        }
+        let peaks = peak_ranges(self.size());
+        let chunk = updates
+            .len()
+            .div_ceil(self.parent.strategy.manual().parallelism())
+            .max(1);
+        let marked = self.parent.strategy.map_collect_vec(updates.chunks(chunk), |chunk| {
+            let mut nodes = Vec::with_capacity(chunk.len());
+            let mut dirty = Vec::new();
+            for &(loc, digest) in chunk {
+                nodes.push((Position::try_from(loc).expect("validated above"), digest));
+                mark_path_dirty(&peaks, loc, &mut dirty);
+            }
+            (nodes, dirty)
+        });
+        for (nodes, dirty) in marked {
+            for (pos, digest) in nodes {
+                self.store_node(pos, digest);
+            }
+            if self.dirty_nodes.len() < dirty.len() {
+                self.dirty_nodes.resize_with(dirty.len(), Vec::new);
+            }
+            for (bucket, positions) in self.dirty_nodes.iter_mut().zip(dirty) {
+                bucket.extend(positions);
+            }
+        }
         Ok(self)
     }
 
@@ -980,6 +1051,38 @@ mod tests {
         });
     }
 
+    fn update_leaf_digests_matches_single_updates<F: Family>() {
+        let executor = deterministic::Runner::default();
+        executor.start(|_| async move {
+            let hasher: H = Standard::new(ForwardFold);
+            let base = build_reference::<F>(&hasher, 257);
+            let updates: Vec<(Location<F>, D)> = (0u64..257)
+                .filter(|i| i % 3 == 0 || i % 7 == 1 || *i == 256)
+                .map(|i| (Location::new(i), hasher.digest(&(i + 1_000).to_be_bytes())))
+                .collect();
+            let mut single = base.new_batch();
+            for &(loc, digest) in &updates {
+                single = single.update_leaf_digest(loc, digest).unwrap();
+            }
+            let single = single.merkleize(&base, &hasher);
+            let strategy = commonware_parallel::Rayon::new(commonware_utils::NZUsize!(4)).unwrap();
+            let batched = base
+                .new_batch_with_strategy(strategy)
+                .update_leaf_digests(&updates)
+                .unwrap()
+                .merkleize(&base, &hasher);
+            assert_eq!(
+                batched.root(&base, &hasher, 0).unwrap(),
+                batch_root(&base, &single, &hasher)
+            );
+            assert!(matches!(
+                base.new_batch()
+                    .update_leaf_digests(&[(Location::new(257), updates[0].1)]),
+                Err(Error::LeafOutOfBounds(_))
+            ));
+        });
+    }
+
     fn proof_verification<F: Family>() {
         let executor = deterministic::Runner::default();
         executor.start(|_| async move {
@@ -1304,6 +1407,10 @@ mod tests {
         update_leaf_batched_roundtrip::<crate::mmr::Family>();
     }
     #[test]
+    fn mmr_update_leaf_digests_matches_single_updates() {
+        update_leaf_digests_matches_single_updates::<crate::mmr::Family>();
+    }
+    #[test]
     fn mmr_proof_verification() {
         proof_verification::<crate::mmr::Family>();
     }
@@ -1430,6 +1537,10 @@ mod tests {
     #[test]
     fn mmb_update_leaf_batched() {
         update_leaf_batched_roundtrip::<crate::mmb::Family>();
+    }
+    #[test]
+    fn mmb_update_leaf_digests_matches_single_updates() {
+        update_leaf_digests_matches_single_updates::<crate::mmb::Family>();
     }
     #[test]
     fn mmb_proof_verification() {

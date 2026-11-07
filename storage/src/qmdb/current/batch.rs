@@ -472,6 +472,30 @@ where
             },
         ))
     }
+
+    /// Reads the operations of the first `target` floor-raise candidates ahead of
+    /// [`merkleize`](Staged::merkleize), so that it only reads those it needs past them.
+    ///
+    /// Each call continues from the candidates of earlier ones, so callers can grow `target`
+    /// as they stage more keys, such as to the number of keys staged so far. Only the ordered
+    /// merkleize consumes these reads.
+    pub async fn prefetch_floor<E, C, I>(
+        &mut self,
+        target: usize,
+        db: &super::db::Db<F, E, C, I, H, U, N, S>,
+    ) -> Result<(), Error<F>>
+    where
+        E: Context,
+        C: Contiguous<Item = Operation<F, U>>,
+        I: UnorderedIndex<Value = Location<F>> + 'static,
+    {
+        let bitmap_parent = &self.bitmap_parent;
+        self.inner
+            .prefetch_floor(target, &db.any, |floor, tip, limit, out| {
+                fill_candidates(bitmap_parent, floor, tip, limit, out)
+            })
+            .await
+    }
 }
 
 impl<F, K, V, H, const N: usize, S: Strategy> Staged<F, H, update::Unordered<K, V>, N, S>
@@ -793,14 +817,17 @@ where
             let _job =
                 tracing::info_span!(parent: &parent_span, "qmdb.current.graft_job").entered();
             let new_leaves = grafting::graft_chunk_digests::<H, _, N>(&strategy, graft_inputs);
-            for (chunk_idx, digest) in new_leaves {
-                if chunk_idx < old_grafted_leaves {
-                    grafted_batch = grafted_batch
-                        .update_leaf_digest(Location::<F>::new(chunk_idx as u64), digest)
-                        .expect("update_leaf_digest failed");
-                } else {
-                    grafted_batch = grafted_batch.add_leaf_digest(digest);
-                }
+            // Inputs ascend by chunk, so every update of an existing leaf precedes the appends.
+            let appended = new_leaves.partition_point(|&(idx, _)| idx < old_grafted_leaves);
+            let updates: Vec<_> = new_leaves[..appended]
+                .iter()
+                .map(|&(idx, digest)| (Location::<F>::new(idx as u64), digest))
+                .collect();
+            grafted_batch = grafted_batch
+                .update_leaf_digests(&updates)
+                .expect("update_leaf_digests failed");
+            for &(_, digest) in &new_leaves[appended..] {
+                grafted_batch = grafted_batch.add_leaf_digest(digest);
             }
             let grafted_hasher = grafting::hasher::<F, H>(grafting_height);
             let merkleized = grafted_batch.merkleize(&grafted_tree, &grafted_hasher);
