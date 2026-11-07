@@ -572,6 +572,21 @@ where
     H: Hasher,
     Operation<F, update::Ordered<K, V>>: Codec,
 {
+    /// Reads the committed predecessors of staged keys that read as absent, which a write would
+    /// create, ahead of [`merkleize`](Staged::merkleize), so that its predecessor search reads
+    /// only those it needs past them. Each call visits only the keys staged since the last one.
+    pub async fn prefetch_predecessors<E, C, I>(
+        &mut self,
+        db: &super::db::Db<F, E, C, I, H, update::Ordered<K, V>, N, S>,
+    ) -> Result<(), Error<F>>
+    where
+        E: Context,
+        C: Contiguous<Item = Operation<F, update::Ordered<K, V>>>,
+        I: crate::index::Ordered<Value = Location<F>>,
+    {
+        self.inner.prefetch_predecessors(&db.any).await
+    }
+
     /// Record updates for staged reads and upserts for unread keys, then merkleize.
     ///
     /// Consumes the staged handle and write vectors. Call [`expand`](Staged::expand) before this

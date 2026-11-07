@@ -57,6 +57,8 @@ where
     shards: Vec<Vec<Operation<F, U>>>,
     /// Continuation point for the live scan after `locs`.
     next_scan: Location<F>,
+    /// Committed operations read ahead for the predecessor search, by location.
+    prev_ops: AHashMap<Location<F>, Operation<F, U>>,
 }
 
 impl<F: Family, U: update::Update> PrefetchedCandidates<F, U>
@@ -322,6 +324,10 @@ where
     resolutions: Vec<StagedResolution<F, U>>,
     /// Floor-raise candidates read ahead by [`prefetch_floor`](Staged::prefetch_floor).
     floor: Option<PrefetchedCandidates<F, U>>,
+    /// Predecessor operations read ahead by `prefetch_predecessors`, by location.
+    prev_ops: AHashMap<Location<F>, Operation<F, U>>,
+    /// How many staged keys `prefetch_predecessors` has visited.
+    prev_scanned: usize,
 }
 
 /// A speculative batch of operations whose root digest has been computed,
@@ -1535,6 +1541,7 @@ where
             locs: Vec::new(),
             shards: Vec::new(),
             next_scan: base_floor,
+            prev_ops: AHashMap::new(),
         });
         let limit = target.saturating_sub(floor.locs.len());
         if limit == 0 {
@@ -1594,6 +1601,8 @@ where
             keys,
             mut resolutions,
             floor: _,
+            prev_ops: _,
+            prev_scanned: _,
         } = self;
         let mut staged_updates = StagedUpdates::<F, U>::new();
         if updates.is_empty() {
@@ -1813,6 +1822,7 @@ where
             locs,
             shards: read?,
             next_scan,
+            prev_ops: AHashMap::new(),
         };
         Ok((batch, staged_updates, prefetched))
     }
@@ -1825,6 +1835,75 @@ where
     H: Hasher,
     Operation<F, update::Ordered<K, V>>: Codec,
 {
+    /// Reads the committed predecessors of staged keys that read as absent, which a write would
+    /// create, ahead of [`merkleize`](Staged::merkleize), whose predecessor search then reads
+    /// only the predecessors it needs past them.
+    ///
+    /// Each call visits only the keys staged since the previous one. A committed location's
+    /// operation never changes, so the reads hold however the snapshot moves meanwhile.
+    pub(crate) async fn prefetch_predecessors<E, C, I, const N: usize>(
+        &mut self,
+        db: &Db<F, E, C, I, H, update::Ordered<K, V>, N, S>,
+    ) -> Result<(), crate::qmdb::Error<F>>
+    where
+        E: Context,
+        C: Contiguous<Item = Operation<F, update::Ordered<K, V>>>,
+        I: crate::index::Ordered<Value = Location<F>>,
+    {
+        let start = mem::replace(&mut self.prev_scanned, self.keys.len());
+        let absent: Vec<&K> = self.keys[start..]
+            .iter()
+            .zip(&self.resolutions[start..])
+            .filter(|(_, resolution)| resolution.is_none())
+            .map(|(key, _)| key)
+            .collect();
+        let mut positions: Vec<u64> = absent
+            .iter()
+            .filter_map(|key| db.snapshot.prev_translated_key(key))
+            .flat_map(|(locs, _)| locs.map(|loc| **loc))
+            .collect();
+        // The live neighbors of each key in the ancestor diffs, which the predecessor search
+        // reads too. Only those an applied ancestor wrote need a read: the rest are in memory.
+        let ancestors: Vec<_> = self.batch.base.parent().map_or_else(Vec::new, |parent| {
+            let mut ancestors = vec![Arc::clone(parent)];
+            ancestors.extend(parent.ancestors());
+            ancestors
+        });
+        let committed = bitmap::Readable::<N>::len(&*db.bitmap);
+        let mut neighbor = |entry: &DiffEntry<F, V::Value>| match entry {
+            DiffEntry::Active { loc, .. } => {
+                if **loc < committed {
+                    positions.push(**loc);
+                }
+                true
+            }
+            DiffEntry::Deleted { .. } => false,
+        };
+        for key in &absent {
+            for ancestor in &ancestors {
+                let diff = ancestor.diff.as_slice();
+                let below = diff.partition_point(|(k, _)| k < *key);
+                // Each scan stops at the first active entry.
+                let _ = diff[..below].iter().rev().any(|(_, e)| neighbor(e));
+                let _ = diff[below..]
+                    .iter()
+                    .skip_while(|(k, _)| k == *key)
+                    .any(|(_, e)| neighbor(e));
+            }
+        }
+        positions.retain(|loc| !self.prev_ops.contains_key(&Location::new(*loc)));
+        if positions.is_empty() {
+            return Ok(());
+        }
+        positions.sort_unstable();
+        positions.dedup();
+        let ops = db.log.read_many_sharded(&positions).await?;
+        for (loc, op) in positions.into_iter().zip(ops.into_iter().flatten()) {
+            self.prev_ops.insert(Location::new(loc), op);
+        }
+        Ok(())
+    }
+
     /// Record updates for staged reads and upserts for unread keys, then merkleize.
     ///
     /// Consumes the staged handle and write vectors. Call [`expand`](Staged::expand) before this
@@ -1936,6 +2015,7 @@ where
         // moves into the job, so its floor and any staged candidates are taken first.
         let scan_from = self.batch.base.inactivity_floor_loc();
         let staged_floor = self.floor.take();
+        let staged_prev_ops = mem::take(&mut self.prev_ops);
         let resolve_len = updates.len() + upserts.len();
         let parent_span = tracing::Span::current();
         let resolve = db.strategy().spawn(resolve_len, move |strategy| {
@@ -1956,7 +2036,9 @@ where
             locs: Vec::new(),
             shards: Vec::new(),
             next_scan: scan_from,
+            prev_ops: AHashMap::new(),
         });
+        prefetched.prev_ops = staged_prev_ops;
         prefetched.truncate(steps_bound);
         let mut read = Ok(());
         if prefetched.locs.len() < steps_bound {
@@ -2139,6 +2221,8 @@ where
                 keys,
                 resolutions,
                 floor: None,
+                prev_ops: AHashMap::new(),
+                prev_scanned: 0,
             },
         ))
     }
@@ -2503,7 +2587,7 @@ where
         db: &Db<F, E, C, I, H, update::Ordered<K, V>, N, S>,
         metadata: Option<V::Value>,
         staged_updates: StagedUpdates<F, update::Ordered<K, V>>,
-        prefetched: Option<PrefetchedCandidates<F, update::Ordered<K, V>>>,
+        mut prefetched: Option<PrefetchedCandidates<F, update::Ordered<K, V>>>,
         fill_candidates: impl FnMut(Location<F>, u64, usize, &mut Vec<Location<F>>) -> Location<F>,
     ) -> Result<Arc<MerkleizedBatch<F, H::Digest, update::Ordered<K, V>, S>>, crate::qmdb::Error<F>>
     where
@@ -2645,11 +2729,29 @@ where
         drop(resolve_span);
         let prev_span =
             tracing::info_span!("qmdb.ordered.prev_reads", ops = prev_locations.len() as u64);
-        let prev_results: Vec<_> = m
-            .read_ops_sharded(&prev_locations, &[], &db.log)
+        // Predecessors staged ahead skip the read. `prev_locations` ascends, so the rest do too.
+        let prev_ops = prefetched
+            .as_mut()
+            .map(|pf| mem::take(&mut pf.prev_ops))
+            .unwrap_or_default();
+        let uncached: Vec<Location<F>> = prev_locations
+            .iter()
+            .filter(|loc| !prev_ops.contains_key(*loc))
+            .copied()
+            .collect();
+        let mut read = m
+            .read_ops_sharded(&uncached, &[], &db.log)
             .await?
             .into_iter()
-            .flatten()
+            .flatten();
+        let prev_results: Vec<_> = prev_locations
+            .iter()
+            .map(|loc| {
+                prev_ops
+                    .get(loc)
+                    .cloned()
+                    .unwrap_or_else(|| read.next().expect("one read per uncached predecessor"))
+            })
             .collect();
         let prev_stale = stale_mask(strategy, &diffs, &prev_results, &prev_locations, ordered_key);
         drop(prev_span);
@@ -2752,15 +2854,27 @@ where
         ancestor_deleted.dedup();
 
         // Batch-read the collected active entries' ops and emit their candidates.
-        let ancestor_locs: Vec<Location<F>> =
-            ancestor_active.iter().map(|&(_, _, loc)| loc).collect();
-        for (op, (key, value, loc)) in m
+        let ancestor_locs: Vec<Location<F>> = ancestor_active
+            .iter()
+            .map(|&(_, _, loc)| loc)
+            .filter(|loc| !prev_ops.contains_key(loc))
+            .collect();
+        let mut read = m
             .read_ops_sharded(&ancestor_locs, &[], &db.log)
             .await?
             .into_iter()
-            .flatten()
-            .zip(ancestor_active)
-        {
+            .flatten();
+        let ancestor_ops: Vec<_> = ancestor_active
+            .iter()
+            .map(|(_, _, loc)| {
+                prev_ops
+                    .get(loc)
+                    .cloned()
+                    .unwrap_or_else(|| read.next().expect("one read per uncached neighbor"))
+            })
+            .collect();
+        drop(prev_ops);
+        for (op, (key, value, loc)) in ancestor_ops.into_iter().zip(ancestor_active) {
             let data = match op {
                 Operation::Update(data) => data,
                 _ => unreachable!("ancestor diff Active should reference Update op"),
@@ -4523,6 +4637,8 @@ mod tests {
             keys,
             resolutions,
             floor: None,
+            prev_ops: AHashMap::new(),
+            prev_scanned: 0,
         }
     }
 

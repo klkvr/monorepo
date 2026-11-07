@@ -211,6 +211,69 @@ pub mod test {
         open_db
     );
 
+    /// Predecessors read ahead for staged creates, at every chain depth and across expansions,
+    /// leave the root as the explicit path computes it.
+    #[test_traced("WARN")]
+    pub fn test_current_ordered_fixed_staged_predecessors_match_explicit() {
+        fn key(i: u64) -> Digest {
+            Sha256::hash(&[&i.to_be_bytes()])
+        }
+        fn val(i: u64) -> Digest {
+            Sha256::hash(&[&(i + 10_000).to_be_bytes()])
+        }
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let db = open_db(context.child("db"), "staged-predecessors".to_string()).await;
+            let mut seed = db.new_batch();
+            for i in (0..400u64).step_by(2) {
+                seed = seed.write(key(i), Some(val(i)));
+            }
+            let seed = seed.merkleize(&db, None).await.unwrap();
+            let (db, _) = db.apply_batch(seed).await.unwrap();
+            let db = db.commit().await.unwrap();
+
+            let parent = db
+                .new_batch()
+                .write(key(1), Some(val(1)))
+                .write(key(2), None)
+                .merkleize(&db, None)
+                .await
+                .unwrap();
+
+            // Creates (odd keys), updates and deletes (even keys), split across an expansion.
+            let read_keys: Vec<Digest> = (0..120u64).map(|i| key(i * 3)).collect();
+            let keys: Vec<&Digest> = read_keys.iter().collect();
+            let updates: Vec<(usize, Option<Digest>)> = (0..read_keys.len())
+                .map(|slot| (slot, (slot % 5 != 0).then(|| val(slot as u64 + 50_000))))
+                .collect();
+
+            let mut explicit = parent.new_batch::<Sha256>();
+            for (slot, value) in &updates {
+                explicit = explicit.write(read_keys[*slot], *value);
+            }
+            let explicit_root = explicit.merkleize(&db, None).await.unwrap().root();
+
+            let split = 50;
+            let (_, mut staged) = parent
+                .new_batch::<Sha256>()
+                .stage(&keys[..split], &db)
+                .await
+                .unwrap();
+            staged.prefetch_predecessors(&db).await.unwrap();
+            let (_, _, mut staged) = staged.expand(&keys[split..], &db).await.unwrap();
+            staged.prefetch_predecessors(&db).await.unwrap();
+            staged.prefetch_floor(read_keys.len(), &db).await.unwrap();
+            let staged_root = staged
+                .merkleize(updates, Vec::new(), None, &db)
+                .await
+                .unwrap()
+                .root();
+            assert_eq!(staged_root, explicit_root);
+
+            db.destroy().await.unwrap();
+        });
+    }
+
     /// Build a `P`-partitioned current db with churny ops across two commits (so the second commit's
     /// updates and deletes inactivate locations from the first), prune it, then assert that
     /// reopening it at a range of worker counts reconstructs the identical root and key-value
