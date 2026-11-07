@@ -33,7 +33,7 @@ use std::{
     iter, mem,
     sync::{Arc, Weak},
 };
-use tracing::debug;
+use tracing::{Instrument as _, debug};
 
 type DiffVec<K, F, V> = Vec<(K, DiffEntry<F, V>)>;
 type DiffSlice<K, F, V> = [(K, DiffEntry<F, V>)];
@@ -1873,20 +1873,28 @@ where
         // moves into the job, so its floor is captured first.
         let scan_from = self.batch.base.inactivity_floor_loc();
         let resolve_len = updates.len() + upserts.len();
+        let parent_span = tracing::Span::current();
         let resolve = db.strategy().spawn(resolve_len, move |strategy| {
+            let _job =
+                tracing::info_span!(parent: &parent_span, "qmdb.staged.resolve_job").entered();
             self.resolve_updates(updates, upserts, &strategy)
         });
 
         // Gather the committed-prefix candidates and read their operations, sharded, while
         // the resolution job runs.
+        let prefetch_span =
+            tracing::info_span!("qmdb.staged.floor_prefetch", bound = steps_bound as u64);
         let committed_tip = bitmap::Readable::<N>::len(&*db.bitmap);
         let mut locs: Vec<Location<F>> = Vec::with_capacity(steps_bound);
         let next_scan = fill_candidates(scan_from, committed_tip, steps_bound, &mut locs);
         let raw: Vec<u64> = locs.iter().map(|loc| **loc).collect();
         let read = db.log.read_many_sharded(&raw).await;
+        drop(prefetch_span);
 
         // Join the resolution and surface any read failure.
-        let (batch, staged_updates) = resolve.await;
+        let (batch, staged_updates) = resolve
+            .instrument(tracing::info_span!("qmdb.staged.resolve_join"))
+            .await;
         let prefetched = PrefetchedCandidates {
             locs,
             shards: read?,

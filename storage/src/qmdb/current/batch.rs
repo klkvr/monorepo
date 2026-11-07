@@ -34,6 +34,7 @@ use commonware_parallel::Strategy;
 use commonware_utils::bitmap::{self, Readable as _};
 use core::ops::Range;
 use std::sync::Arc;
+use tracing::Instrument as _;
 
 /// Speculative chunk-level bitmap overlay.
 ///
@@ -785,9 +786,12 @@ where
     let mut grafted_batch = grafted_parent.new_batch();
     let ancestors = grafted_batch.retain_ancestors();
     let grafted_tree = Arc::clone(grafted_tree);
+    let parent_span = tracing::Span::current();
     strategy
         .clone()
         .spawn(graft_inputs.len(), move |strategy| {
+            let _job =
+                tracing::info_span!(parent: &parent_span, "qmdb.current.graft_job").entered();
             let new_leaves = grafting::graft_chunk_digests::<H, _, N>(&strategy, graft_inputs);
             for (chunk_idx, digest) in new_leaves {
                 if chunk_idx < old_grafted_leaves {
@@ -831,6 +835,7 @@ where
     let batch_base = *inner.bounds.tip.size - batch_len as u64;
 
     // Build chunk overlay: materialized bytes for every dirty chunk.
+    let overlay_span = tracing::info_span!("qmdb.current.overlay", chunks = tracing::field::Empty);
     let overlay = build_chunk_overlay::<F, U, _, N>(
         bitmap_parent,
         batch_len,
@@ -838,6 +843,8 @@ where
         &inner.diff,
         &inner.ancestor_diffs,
     );
+    overlay_span.record("chunks", overlay.chunks.len() as u64);
+    drop(overlay_span);
 
     let grafting_height = grafting::height::<N>();
     let ops_tree_adapter =
@@ -908,6 +915,8 @@ where
         graft_inputs.sort_unstable_by_key(|&(idx, _, _)| idx);
     }
     drop(graft_span);
+    let graft_merkleize_span =
+        tracing::info_span!("qmdb.current.graft_merkleize", inputs = graft_inputs.len() as u64);
     let grafted_batch = if graft_inputs.is_empty() {
         let grafted_hasher = grafting::hasher::<F, H>(grafting_height);
         grafted_parent
@@ -921,8 +930,10 @@ where
             graft_inputs,
             grafting_height,
         )
+        .instrument(graft_merkleize_span.clone())
         .await
     };
+    drop(graft_merkleize_span);
 
     // Build the layered bitmap (parent + overlay) before computing the canonical root, so that
     // compute_db_root sees newly completed chunks. Using bitmap_parent alone would miss chunks
@@ -948,6 +959,7 @@ where
     // coexist; this branch only handles partial. The pending chunk (when present) is read
     // from the bitmap inside `compute_db_root` via `pending_chunk()`.
     let partial = partial_chunk::<_, N>(&bitmap_batch);
+    let db_root_span = tracing::info_span!("qmdb.current.db_root");
     let canonical_root = compute_db_root::<F, H, _, _, N>(
         &bitmap_batch,
         &grafted_storage,
@@ -956,6 +968,7 @@ where
         inner.bounds.inactivity_floor,
         &ops_root,
     )
+    .instrument(db_root_span)
     .await?;
 
     Ok(Arc::new(MerkleizedBatch {
