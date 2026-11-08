@@ -22,7 +22,7 @@ use crate::{
         update_known_loc,
     },
 };
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashMap;
 use commonware_codec::Codec;
 use commonware_cryptography::{Digest, Hasher};
 use commonware_parallel::Strategy;
@@ -59,6 +59,10 @@ where
     next_scan: Location<F>,
     /// Committed operations read ahead for the predecessor search, by location.
     prev_ops: AHashMap<Location<F>, Operation<F, U>>,
+    /// The committed predecessor locations of keys looked up ahead, by key.
+    prev_locs: AHashMap<U::Key, Vec<Location<F>>>,
+    /// The committed tip `prev_locs` were looked up at: they hold only while it is unchanged.
+    prev_tip: Option<u64>,
 }
 
 impl<F: Family, U: update::Update> PrefetchedCandidates<F, U>
@@ -326,6 +330,10 @@ where
     floor: Option<PrefetchedCandidates<F, U>>,
     /// Predecessor operations read ahead by `prefetch_predecessors`, by location.
     prev_ops: AHashMap<Location<F>, Operation<F, U>>,
+    /// Committed predecessor locations looked up by `prefetch_predecessors`, by key.
+    prev_locs: AHashMap<U::Key, Vec<Location<F>>>,
+    /// The committed tip `prev_locs` were looked up at.
+    prev_tip: Option<u64>,
     /// How many staged keys `prefetch_predecessors` has visited.
     prev_scanned: usize,
 }
@@ -1542,6 +1550,8 @@ where
             shards: Vec::new(),
             next_scan: base_floor,
             prev_ops: AHashMap::new(),
+            prev_locs: AHashMap::new(),
+            prev_tip: None,
         });
         let limit = target.saturating_sub(floor.locs.len());
         if limit == 0 {
@@ -1602,6 +1612,8 @@ where
             mut resolutions,
             floor: _,
             prev_ops: _,
+            prev_locs: _,
+            prev_tip: _,
             prev_scanned: _,
         } = self;
         let mut staged_updates = StagedUpdates::<F, U>::new();
@@ -1823,6 +1835,8 @@ where
             shards: read?,
             next_scan,
             prev_ops: AHashMap::new(),
+            prev_locs: AHashMap::new(),
+            prev_tip: None,
         };
         Ok((batch, staged_updates, prefetched))
     }
@@ -1850,6 +1864,15 @@ where
         C: Contiguous<Item = Operation<F, update::Ordered<K, V>>>,
         I: crate::index::Ordered<Value = Location<F>>,
     {
+        // Looked-up predecessor locations hold only on the snapshot they were looked up on, which
+        // changes only when a batch is applied, growing the committed tip: look them all up again
+        // then.
+        let committed = bitmap::Readable::<N>::len(&*db.bitmap);
+        if self.prev_tip != Some(committed) {
+            self.prev_tip = Some(committed);
+            self.prev_locs.clear();
+            self.prev_scanned = 0;
+        }
         let start = mem::replace(&mut self.prev_scanned, self.keys.len());
         let absent: Vec<&K> = self.keys[start..]
             .iter()
@@ -1857,11 +1880,16 @@ where
             .filter(|(_, resolution)| resolution.is_none())
             .map(|(key, _)| key)
             .collect();
-        let mut positions: Vec<u64> = absent
-            .iter()
-            .filter_map(|key| db.snapshot.prev_translated_key(key))
-            .flat_map(|(locs, _)| locs.map(|loc| **loc))
-            .collect();
+        let mut positions: Vec<u64> = Vec::new();
+        for &key in &absent {
+            let locs: Vec<Location<F>> = db
+                .snapshot
+                .prev_translated_key(key)
+                .map(|(locs, _)| locs.copied().collect())
+                .unwrap_or_default();
+            positions.extend(locs.iter().map(|loc| **loc));
+            self.prev_locs.insert(key.clone(), locs);
+        }
         // The live neighbors of each key in the ancestor diffs, which the predecessor search
         // reads too. Only those an applied ancestor wrote need a read: the rest are in memory.
         let ancestors: Vec<_> = self.batch.base.parent().map_or_else(Vec::new, |parent| {
@@ -1869,7 +1897,6 @@ where
             ancestors.extend(parent.ancestors());
             ancestors
         });
-        let committed = bitmap::Readable::<N>::len(&*db.bitmap);
         let mut neighbor = |entry: &DiffEntry<F, V::Value>| match entry {
             DiffEntry::Active { loc, .. } => {
                 if **loc < committed {
@@ -2001,13 +2028,13 @@ where
             .filter(|(slot, _)| self.resolutions.get(*slot).is_some_and(Option::is_some))
             .count()
             .min(self.keys.len());
-        let existing_writes = upserts
+        // The writes' snapshot probes run while the resolution job below runs.
+        let write_keys: Vec<K> = upserts
             .iter()
             .map(|(key, _)| key)
             .chain(self.batch.mutations.keys())
-            .filter(|&key| db.snapshot.get(key).next().is_some())
-            .count();
-        let steps_bound = resolved_updates + existing_writes + 1;
+            .cloned()
+            .collect();
 
         // Overlap the serial update resolution with the candidate prefetch: the
         // committed-prefix candidate set depends only on the base floor, the candidate
@@ -2016,6 +2043,8 @@ where
         let scan_from = self.batch.base.inactivity_floor_loc();
         let staged_floor = self.floor.take();
         let staged_prev_ops = mem::take(&mut self.prev_ops);
+        let staged_prev_locs = mem::take(&mut self.prev_locs);
+        let staged_prev_tip = self.prev_tip;
         let resolve_len = updates.len() + upserts.len();
         let parent_span = tracing::Span::current();
         let resolve = db.strategy().spawn(resolve_len, move |strategy| {
@@ -2023,6 +2052,18 @@ where
                 tracing::info_span!(parent: &parent_span, "qmdb.staged.resolve_job").entered();
             self.resolve_updates(updates, upserts, &strategy)
         });
+
+        let snapshot = &db.snapshot;
+        let existing_writes: usize = map_chunks(db.strategy(), &write_keys, |_, chunk| {
+            chunk
+                .iter()
+                .filter(|&key| snapshot.get(key).next().is_some())
+                .count()
+        })
+        .into_iter()
+        .sum();
+        drop(write_keys);
+        let steps_bound = resolved_updates + existing_writes + 1;
 
         // Gather the committed-prefix candidates past those staged ahead and read their
         // operations, sharded, while the resolution job runs. Staged candidates beyond the
@@ -2037,8 +2078,12 @@ where
             shards: Vec::new(),
             next_scan: scan_from,
             prev_ops: AHashMap::new(),
+            prev_locs: AHashMap::new(),
+            prev_tip: None,
         });
         prefetched.prev_ops = staged_prev_ops;
+        prefetched.prev_locs = staged_prev_locs;
+        prefetched.prev_tip = staged_prev_tip;
         prefetched.truncate(steps_bound);
         let mut read = Ok(());
         if prefetched.locs.len() < steps_bound {
@@ -2222,6 +2267,8 @@ where
                 resolutions,
                 floor: None,
                 prev_ops: AHashMap::new(),
+                prev_locs: AHashMap::new(),
+                prev_tip: None,
                 prev_scanned: 0,
             },
         ))
@@ -2602,6 +2649,8 @@ where
             "qmdb.ordered.resolve",
             mutations = mutations.len() as u64,
             depth = m.ancestors.len() as u64,
+            changed = tracing::field::Empty,
+            prev_cached = tracing::field::Empty,
         );
         // Resolve existing keys.
         let locations = m.gather_existing_locations(&mutations, db, true);
@@ -2713,16 +2762,33 @@ where
             .chain(created.iter().map(|(k, _, _)| k))
             .collect();
         let snapshot = &db.snapshot;
+        // Predecessor locations looked up while the block executed hold while no batch has been
+        // applied since.
+        let committed_tip = bitmap::Readable::<N>::len(&*db.bitmap);
+        let cached_locs = prefetched
+            .as_mut()
+            .filter(|pf| pf.prev_tip == Some(committed_tip))
+            .map(|pf| mem::take(&mut pf.prev_locs))
+            .unwrap_or_default();
+        let cached_hits = std::sync::atomic::AtomicU64::new(0);
         let mut prev_locations: Vec<Location<F>> = map_chunks(strategy, &changed, |_, chunk| {
             let mut out = Vec::with_capacity(chunk.len());
+            let mut hits = 0;
             for &key in chunk {
-                if let Some((iter, _)) = snapshot.prev_translated_key(key) {
+                if let Some(locs) = cached_locs.get(key) {
+                    hits += 1;
+                    out.extend_from_slice(locs);
+                } else if let Some((iter, _)) = snapshot.prev_translated_key(key) {
                     out.extend(iter.copied());
                 }
             }
+            cached_hits.fetch_add(hits, std::sync::atomic::Ordering::Relaxed);
             out
         })
         .concat();
+        drop(cached_locs);
+        resolve_span.record("changed", changed.len() as u64);
+        resolve_span.record("prev_cached", cached_hits.into_inner());
         strategy.sort_by(&mut prev_locations, |a, b| a.cmp(b));
         prev_locations.dedup();
 
@@ -2808,48 +2874,62 @@ where
                 None
             }
         };
-        let mut seen: AHashSet<&K> = AHashSet::new();
         let mut ancestor_deleted: Vec<K> = Vec::new();
         let mut ancestor_active: Vec<(&K, &V::Value, Location<F>)> = Vec::new();
         for (depth, &diff) in diffs.iter().enumerate() {
             let closer = &diffs[..depth];
-            // Records the entry at index i of the diff a scan meets and returns whether its key
-            // is live, which ends the scan.
-            let mut visit = |i: usize| -> bool {
-                let (key, entry) = &diff[i];
-                if let Some(live) = written(key) {
-                    return live;
-                }
-                if let Some(newer) = resolve_in_diffs(closer, key) {
-                    return matches!(newer, DiffEntry::Active { .. });
-                }
-                if seen.insert(key) {
+            // Each changed key's scans are independent, so they shard across the pool. A key
+            // met by several scans records the same entry each time and is deduplicated below.
+            let found = map_chunks(strategy, &changed_keys, |_, chunk| {
+                let mut active: Vec<(&K, &V::Value, Location<F>)> = Vec::new();
+                let mut deleted: Vec<K> = Vec::new();
+                // Records the entry at index i of the diff a scan meets and returns whether its
+                // key is live, which ends the scan.
+                let mut visit = |i: usize| -> bool {
+                    let (key, entry) = &diff[i];
+                    if let Some(live) = written(key) {
+                        return live;
+                    }
+                    if let Some(newer) = resolve_in_diffs(closer, key) {
+                        return matches!(newer, DiffEntry::Active { .. });
+                    }
                     match entry {
                         DiffEntry::Active { value, loc, .. } => {
-                            ancestor_active.push((key, value, *loc));
+                            active.push((key, value, *loc));
+                            true
                         }
-                        DiffEntry::Deleted { .. } => ancestor_deleted.push(key.clone()),
+                        DiffEntry::Deleted { .. } => {
+                            deleted.push(key.clone());
+                            false
+                        }
+                    }
+                };
+                for &changed in chunk {
+                    let below = diff.partition_point(|(key, _)| key < changed);
+                    let above =
+                        below + usize::from(diff.get(below).is_some_and(|(k, _)| k == changed));
+                    // Keys form a cycle, the last key's next key being the first, so each scan
+                    // wraps around the diff's ends.
+                    for i in (0..below).rev().chain((above..diff.len()).rev()) {
+                        if visit(i) {
+                            break;
+                        }
+                    }
+                    for i in (above..diff.len()).chain(0..below) {
+                        if visit(i) {
+                            break;
+                        }
                     }
                 }
-                matches!(entry, DiffEntry::Active { .. })
-            };
-            for &changed in &changed_keys {
-                let below = diff.partition_point(|(key, _)| key < changed);
-                let above = below + usize::from(diff.get(below).is_some_and(|(k, _)| k == changed));
-                // Keys form a cycle, the last key's next key being the first, so each scan wraps
-                // around the diff's ends.
-                for i in (0..below).rev().chain((above..diff.len()).rev()) {
-                    if visit(i) {
-                        break;
-                    }
-                }
-                for i in (above..diff.len()).chain(0..below) {
-                    if visit(i) {
-                        break;
-                    }
-                }
+                (active, deleted)
+            });
+            for (active, deleted) in found {
+                ancestor_active.extend(active);
+                ancestor_deleted.extend(deleted);
             }
         }
+        ancestor_active.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        ancestor_active.dedup_by(|a, b| a.0 == b.0);
         ancestor_deleted.sort();
         ancestor_deleted.dedup();
 
@@ -4638,6 +4718,8 @@ mod tests {
             resolutions,
             floor: None,
             prev_ops: AHashMap::new(),
+            prev_locs: AHashMap::new(),
+            prev_tip: None,
             prev_scanned: 0,
         }
     }

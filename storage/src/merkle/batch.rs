@@ -455,6 +455,14 @@ impl<F: Family, D: Digest, S: Strategy> UnmerkleizedBatch<F, D, S> {
             bucket.sort();
             bucket.dedup();
         }
+        // Reserve for every dirty node at once: growing the overwrite map node by node rehashes
+        // it repeatedly. Appended nodes are stored elsewhere, so this can over-reserve.
+        let parent_size = self.parent.size();
+        let overwritten = buckets
+            .iter()
+            .map(|bucket| bucket.partition_point(|&pos| pos < parent_size))
+            .sum();
+        self.overwrites.reserve(overwritten);
         for (height, positions) in buckets.iter().enumerate() {
             if positions.is_empty() {
                 continue;
@@ -466,7 +474,6 @@ impl<F: Family, D: Digest, S: Strategy> UnmerkleizedBatch<F, D, S> {
         let (ancestor_base_size, ancestor_appended, ancestor_overwrites) =
             collect_ancestor_batches(&self.parent);
 
-        let parent_size = self.parent.size();
         Arc::new(MerkleizedBatch {
             parent: Some(Arc::downgrade(&self.parent)),
             appended: Arc::new(self.appended),
