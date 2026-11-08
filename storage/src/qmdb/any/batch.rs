@@ -1874,11 +1874,11 @@ where
             self.prev_scanned = 0;
         }
         let start = mem::replace(&mut self.prev_scanned, self.keys.len());
+        // Every staged key: absent keys are created if the block writes them, and present keys
+        // deleted, and either rewrites the key's predecessor.
         let absent: Vec<&K> = self.keys[start..]
             .iter()
-            .zip(&self.resolutions[start..])
-            .filter(|(_, resolution)| resolution.is_none())
-            .map(|(key, _)| key)
+            .filter(|key| !self.prev_locs.contains_key(*key))
             .collect();
         let mut positions: Vec<u64> = Vec::new();
         for &key in &absent {
