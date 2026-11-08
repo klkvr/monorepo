@@ -38,6 +38,9 @@ use tracing::{Instrument as _, debug};
 type DiffVec<K, F, V> = Vec<(K, DiffEntry<F, V>)>;
 type DiffSlice<K, F, V> = [(K, DiffEntry<F, V>)];
 
+/// How many floor-raise candidates a staged merkleize reads ahead per step it bounds the raise to.
+pub(crate) const FLOOR_PREFETCH_FACTOR: usize = 2;
+
 /// Sorted locations at the retained batch chain's committed boundary.
 type AncestorBaseLocs<K, F> = Vec<(K, Option<Location<F>>)>;
 
@@ -2100,11 +2103,16 @@ where
         prefetched.prev_ops = staged_prev_ops;
         prefetched.prev_locs = staged_prev_locs;
         prefetched.prev_tip = staged_prev_tip;
-        prefetched.truncate(steps_bound);
+        // Many candidates turn out inactive (superseded by this batch or an ancestor), so the
+        // raise scans past more candidates than it moves operations. Read ahead twice the bound:
+        // handing the raise extra candidates is outcome-identical, and reading them here, while
+        // the resolution runs, saves the raise reading them serially.
+        let target = steps_bound * FLOOR_PREFETCH_FACTOR;
+        prefetched.truncate(target);
         let mut read = Ok(());
-        if prefetched.locs.len() < steps_bound {
+        if prefetched.locs.len() < target {
             let committed_tip = bitmap::Readable::<N>::len(&*db.bitmap);
-            let limit = steps_bound - prefetched.locs.len();
+            let limit = target - prefetched.locs.len();
             let mut locs: Vec<Location<F>> = Vec::with_capacity(limit);
             let next_scan = fill_candidates(prefetched.next_scan, committed_tip, limit, &mut locs);
             let raw: Vec<u64> = locs.iter().map(|loc| **loc).collect();
