@@ -411,6 +411,14 @@ impl<F: Family, D: Digest, S: Strategy> UnmerkleizedBatch<F, D, S> {
             }
             (nodes, dirty)
         });
+        // Reserve for the leaves and every node above them at once: `merkleize` stores those
+        // nodes too, and growing the overwrite map in steps rehashes it each time. Duplicate
+        // markers across chunks make this an overestimate.
+        let stored: usize = marked
+            .iter()
+            .map(|(nodes, dirty)| nodes.len() + dirty.iter().map(Vec::len).sum::<usize>())
+            .sum();
+        self.overwrites.reserve(stored);
         for (nodes, dirty) in marked {
             for (pos, digest) in nodes {
                 self.store_node(pos, digest);
