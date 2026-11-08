@@ -100,8 +100,45 @@ use commonware_cryptography::Digest;
 use commonware_parallel::{Sequential, Strategy};
 use core::ops::Range;
 
-/// Overwritten node digests keyed by position.
-pub(crate) type Overwrites<F, D> = hashbrown::HashMap<Position<F>, D, RandomState>;
+/// Leaf digests an unmerkleized batch overwrites, keyed by position.
+type LeafOverwrites<F, D> = hashbrown::HashMap<Position<F>, D, RandomState>;
+
+/// A merkleized batch's overwritten node digests, sorted by position.
+///
+/// Merkleizing produces each height's digests in position order, so collecting them into one
+/// sorted run is cheaper than inserting every node into a hash map.
+#[derive(Debug)]
+pub(crate) struct Overwrites<F: Family, D> {
+    entries: Vec<(Position<F>, D)>,
+}
+
+impl<F: Family, D> Default for Overwrites<F, D> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+}
+
+impl<F: Family, D> Overwrites<F, D> {
+    /// The digest overwritten at `pos`, if any.
+    pub(crate) fn get(&self, pos: &Position<F>) -> Option<&D> {
+        self.entries
+            .binary_search_by(|(p, _)| p.cmp(pos))
+            .ok()
+            .map(|i| &self.entries[i].1)
+    }
+
+    /// The overwritten positions and digests, in position order.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&Position<F>, &D)> {
+        self.entries.iter().map(|(pos, digest)| (pos, digest))
+    }
+
+    /// Whether nothing is overwritten.
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
 
 /// Each peak of a tree of `size` nodes, with its height and its first leaf.
 fn peak_ranges<F: Family>(size: Position<F>) -> Vec<(Position<F>, u32, Location<F>)> {
@@ -167,7 +204,9 @@ fn push_dirty<F: Family>(buckets: &mut Vec<Vec<Position<F>>>, height: u32, pos: 
 pub struct UnmerkleizedBatch<F: Family, D: Digest, S: Strategy> {
     parent: Arc<MerkleizedBatch<F, D, S>>,
     appended: Vec<D>,
-    overwrites: Overwrites<F, D>,
+    overwrites: LeafOverwrites<F, D>,
+    /// Digests merkleizing computed for overwritten nodes, by height, each in position order.
+    computed: Vec<Vec<(Position<F>, D)>>,
     /// Dirty internal node positions bucketed by height. Outer index is height; inner Vec
     /// holds positions at that height in push order (monotonically increasing for
     /// `add_leaf_digest`; may contain duplicates from interleaved `mark_dirty` walks, deduped
@@ -181,7 +220,8 @@ impl<F: Family, D: Digest, S: Strategy> UnmerkleizedBatch<F, D, S> {
         Self {
             parent,
             appended: Vec::new(),
-            overwrites: Overwrites::default(),
+            overwrites: LeafOverwrites::default(),
+            computed: Vec::new(),
             dirty_nodes: Vec::new(),
         }
     }
@@ -455,20 +495,27 @@ impl<F: Family, D: Digest, S: Strategy> UnmerkleizedBatch<F, D, S> {
             bucket.sort();
             bucket.dedup();
         }
-        // Reserve for every dirty node at once: growing the overwrite map node by node rehashes
-        // it repeatedly. Appended nodes are stored elsewhere, so this can over-reserve.
         let parent_size = self.parent.size();
-        let overwritten = buckets
-            .iter()
-            .map(|bucket| bucket.partition_point(|&pos| pos < parent_size))
-            .sum();
-        self.overwrites.reserve(overwritten);
+        self.computed.resize_with(buckets.len(), Vec::new);
         for (height, positions) in buckets.iter().enumerate() {
             if positions.is_empty() {
                 continue;
             }
             self.merkleize_bucket(base, hasher, positions, height as u32);
         }
+        // Every height's run is sorted and the runs are disjoint, which the stable sort merges
+        // in linear passes.
+        let computed = core::mem::take(&mut self.computed);
+        let mut entries = Vec::with_capacity(
+            self.overwrites.len() + computed.iter().map(Vec::len).sum::<usize>(),
+        );
+        entries.extend(self.overwrites.drain());
+        entries.sort_unstable_by_key(|&(pos, _)| pos);
+        for run in computed {
+            entries.extend(run);
+        }
+        entries.sort_by_key(|&(pos, _)| pos);
+        let overwrites = Overwrites { entries };
 
         // Collect ancestor data by walking the parent chain (strong Arc + Weak walk).
         let (ancestor_base_size, ancestor_appended, ancestor_overwrites) =
@@ -477,7 +524,7 @@ impl<F: Family, D: Digest, S: Strategy> UnmerkleizedBatch<F, D, S> {
         Arc::new(MerkleizedBatch {
             parent: Some(Arc::downgrade(&self.parent)),
             appended: Arc::new(self.appended),
-            overwrites: Arc::new(self.overwrites),
+            overwrites: Arc::new(overwrites),
             parent_size,
             base_size: self.parent.base_size,
             ancestor_base_size,
@@ -491,9 +538,22 @@ impl<F: Family, D: Digest, S: Strategy> UnmerkleizedBatch<F, D, S> {
     /// Fetch the child digests of the node at `pos`.
     fn child_digests(&self, base: &Mem<F, D>, pos: Position<F>, height: u32) -> (D, D) {
         let (left, right) = F::children(pos, height);
-        let left = self.get_node(base, left).expect("left child missing");
-        let right = self.get_node(base, right).expect("right child missing");
+        let left = self.child_node(base, left, height).expect("left child missing");
+        let right = self.child_node(base, right, height).expect("right child missing");
         (left, right)
+    }
+
+    /// Resolve a child of a node at the given height, first among the digests merkleizing
+    /// computed for the height below.
+    fn child_node(&self, base: &Mem<F, D>, pos: Position<F>, height: u32) -> Option<D> {
+        if let Some(run) = height
+            .checked_sub(1)
+            .and_then(|h| self.computed.get(h as usize))
+            && let Ok(i) = run.binary_search_by(|(p, _)| p.cmp(&pos))
+        {
+            return Some(run[i].1);
+        }
+        self.get_node(base, pos)
     }
 
     /// Compute the digests of `positions` two at a time so the hasher can make progress on both
@@ -550,11 +610,18 @@ impl<F: Family, D: Digest, S: Strategy> UnmerkleizedBatch<F, D, S> {
                     computed
                 },
             );
+        let parent_size = self.parent.size();
+        let mut run = core::mem::take(&mut self.computed[height as usize]);
         for nodes in computed {
             for (pos, digest) in nodes {
-                self.store_node(pos, digest);
+                if pos >= parent_size {
+                    self.appended[(*pos - *parent_size) as usize] = digest;
+                } else {
+                    run.push((pos, digest));
+                }
             }
         }
+        self.computed[height as usize] = run;
     }
 }
 
