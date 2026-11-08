@@ -1237,29 +1237,14 @@ where
                     let live = &read_candidates[pf_count..];
                     let mut resolved = pf_shards;
                     if !live.is_empty() {
-                        resolved.extend(
-                            self.read_ops_sharded(live, &ops, &db.log)
-                                .instrument(tracing::info_span!(
-                                    "qmdb.floor.live_read",
-                                    ops = live.len() as u64,
-                                    prefetched = pf_count as u64,
-                                ))
-                                .await?,
-                        );
+                        resolved.extend(self.read_ops_sharded(live, &ops, &db.log).await?);
                     }
 
                     // Classification is the first consumer of the sorted diff. By now the
                     // sort has overlapped the fill and read above.
                     if let Some(job) = diff_sort.take() {
-                        diff = job
-                            .instrument(tracing::info_span!("qmdb.floor.diff_sort_wait"))
-                            .await;
+                        diff = job.await;
                     }
-                    let _classify = tracing::info_span!(
-                        "qmdb.floor.classify",
-                        candidates = read_candidates.len() as u64
-                    )
-                    .entered();
 
                     // Classify read candidates against the pre-raise state (see
                     // [`FloorOutcome`]). Revalidation is required even for candidates whose
@@ -1315,7 +1300,6 @@ where
                 // Apply in candidate order, moving active ops to the tip. `read_candidates`
                 // preserves candidate order, so a candidate that does not match the next
                 // pending read was superseded and only advances the floor.
-                let _apply = tracing::info_span!("qmdb.floor.apply").entered();
                 let mut outcomes = outcomes.into_iter();
                 let mut reads = resolved.into_iter().flatten();
                 let mut pending = read_candidates.iter().peekable();
