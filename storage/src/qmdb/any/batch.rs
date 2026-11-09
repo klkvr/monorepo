@@ -336,6 +336,10 @@ where
     prev_tip: Option<u64>,
     /// How many staged keys `prefetch_predecessors` has visited.
     prev_scanned: usize,
+    /// Keys the block is expected to delete, from [`hint_deletes`](Staged::hint_deletes).
+    deletes: Vec<U::Key>,
+    /// How many of `deletes` `prefetch_predecessors` has visited.
+    deletes_scanned: usize,
 }
 
 /// A speculative batch of operations whose root digest has been computed,
@@ -1615,6 +1619,8 @@ where
             prev_locs: _,
             prev_tip: _,
             prev_scanned: _,
+            deletes: _,
+            deletes_scanned: _,
         } = self;
         let mut staged_updates = StagedUpdates::<F, U>::new();
         if updates.is_empty() {
@@ -1849,6 +1855,13 @@ where
     H: Hasher,
     Operation<F, update::Ordered<K, V>>: Codec,
 {
+    /// Queue `keys`, which the block is expected to delete, for the next
+    /// [`prefetch_predecessors`](Staged::prefetch_predecessors) to read the predecessors of.
+    /// A hint the block's final writes do not delete only costs that read.
+    pub fn hint_deletes(&mut self, keys: impl IntoIterator<Item = K>) {
+        self.deletes.extend(keys);
+    }
+
     /// Reads the committed predecessors of staged keys that read as absent, which a write would
     /// create, ahead of [`merkleize`](Staged::merkleize), whose predecessor search then reads
     /// only the predecessors it needs past them.
@@ -1872,13 +1885,18 @@ where
             self.prev_tip = Some(committed);
             self.prev_locs.clear();
             self.prev_scanned = 0;
+            self.deletes_scanned = 0;
         }
         let start = mem::replace(&mut self.prev_scanned, self.keys.len());
+        let deletes_start = mem::replace(&mut self.deletes_scanned, self.deletes.len());
+        // Deleting a key rewrites its predecessor like creating one does, so hinted deletes
+        // join the keys that read as absent.
         let absent: Vec<&K> = self.keys[start..]
             .iter()
             .zip(&self.resolutions[start..])
             .filter(|(_, resolution)| resolution.is_none())
             .map(|(key, _)| key)
+            .chain(&self.deletes[deletes_start..])
             .collect();
         let mut positions: Vec<u64> = Vec::new();
         for &key in &absent {
@@ -2270,6 +2288,8 @@ where
                 prev_locs: AHashMap::new(),
                 prev_tip: None,
                 prev_scanned: 0,
+                deletes: Vec::new(),
+                deletes_scanned: 0,
             },
         ))
     }
@@ -4749,6 +4769,8 @@ mod tests {
             prev_locs: AHashMap::new(),
             prev_tip: None,
             prev_scanned: 0,
+            deletes: Vec::new(),
+            deletes_scanned: 0,
         }
     }
 
