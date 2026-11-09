@@ -442,6 +442,71 @@ fn resolve_in_diffs<'a, K: Ord, F: Family, V>(
     diffs.iter().find_map(|diff| lookup_sorted(diff, key))
 }
 
+/// How an ancestor-walk scan treats one diff entry: `ScanKind::Pass` steps over a key that is
+/// dead after the batch, `ScanKind::Stop` ends at a live key the batch or a closer diff owns,
+/// and `ScanKind::Own` leaves the decision to the entry itself.
+#[derive(Clone, Copy)]
+enum ScanKind {
+    Pass,
+    Stop,
+    Own,
+}
+
+/// Classify each entry of `diff` for the ancestor walk: keys the batch writes are live unless
+/// deleted, then the closest of `closer` holding the key decides, else the entry does. All
+/// inputs ascend by key, so each chunk merges them linearly.
+#[track_caller]
+fn scan_kinds<K: Ord + Sync, F: Family, V: Sync, A: Sync, B: Sync, C: Sync, D: Sync, S: Strategy>(
+    strategy: &S,
+    diff: &DiffSlice<K, F, V>,
+    updated: &[(K, A, B)],
+    created: &[(K, A, C)],
+    deleted: &[(K, D)],
+    closer: &[&DiffSlice<K, F, V>],
+) -> Vec<ScanKind> {
+    // Advance `cursor` past keys below `key` and report whether it lands on `key`.
+    fn seek<K: Ord, T>(items: &[T], cursor: &mut usize, key: &K, key_of: impl Fn(&T) -> &K) -> bool {
+        while items.get(*cursor).is_some_and(|item| key_of(item) < key) {
+            *cursor += 1;
+        }
+        items.get(*cursor).is_some_and(|item| key_of(item) == key)
+    }
+    map_chunks(strategy, diff, |_, chunk| {
+        let first = &chunk[0].0;
+        let mut u = updated.partition_point(|(k, ..)| k < first);
+        let mut c = created.partition_point(|(k, ..)| k < first);
+        let mut d = deleted.partition_point(|(k, _)| k < first);
+        let mut cl: Vec<usize> =
+            closer.iter().map(|diff| diff.partition_point(|(k, _)| k < first)).collect();
+        chunk
+            .iter()
+            .map(|(key, _)| {
+                let up = seek(updated, &mut u, key, |(k, ..)| k);
+                let cr = seek(created, &mut c, key, |(k, ..)| k);
+                let del = seek(deleted, &mut d, key, |(k, _)| k);
+                if up || cr {
+                    return ScanKind::Stop;
+                }
+                if del {
+                    return ScanKind::Pass;
+                }
+                // Closest diff first wins, so walk farthest to closest and keep the last hit.
+                let mut kind = ScanKind::Own;
+                for (diff, cursor) in closer.iter().zip(cl.iter_mut()).rev() {
+                    if seek(diff, cursor, key, |(k, _)| k) {
+                        kind = match &diff[*cursor].1 {
+                            DiffEntry::Active { .. } => ScanKind::Stop,
+                            DiffEntry::Deleted { .. } => ScanKind::Pass,
+                        };
+                    }
+                }
+                kind
+            })
+            .collect::<Vec<_>>()
+    })
+    .concat()
+}
+
 /// Run `f` over contiguous chunks of `items`, serially or sharded across the strategy pool
 /// as its policy decides, returning one output per chunk in order. `f` receives each chunk's
 /// starting index in `items`.
@@ -2881,22 +2946,12 @@ where
             .chain(created.iter().map(|(k, _, _)| k))
             .collect();
         changed_keys.sort_unstable();
-        // Whether a key this batch writes is live after it, or `None` for keys it doesn't write.
-        let written = |key: &K| -> Option<bool> {
-            if updated.binary_search_by(|(k, ..)| k.cmp(key)).is_ok()
-                || created.binary_search_by(|(k, ..)| k.cmp(key)).is_ok()
-            {
-                Some(true)
-            } else if deleted.binary_search_by(|(k, _)| k.cmp(key)).is_ok() {
-                Some(false)
-            } else {
-                None
-            }
-        };
         let mut ancestor_deleted: Vec<K> = Vec::new();
         let mut ancestor_active: Vec<(&K, &V::Value, Location<F>)> = Vec::new();
         for (depth, &diff) in diffs.iter().enumerate() {
-            let closer = &diffs[..depth];
+            // Classify every entry once by merging against this batch's sorted writes and the
+            // closer diffs, so each scan step reads a flag instead of binary-searching them.
+            let kinds = scan_kinds(strategy, diff, &updated, &created, &deleted, &diffs[..depth]);
             // Each changed key's scans are independent, so they shard across the pool. A key
             // met by several scans records the same entry each time and is deduplicated below.
             let found = map_chunks(strategy, &changed_keys, |_, chunk| {
@@ -2905,22 +2960,19 @@ where
                 // Records the entry at index i of the diff a scan meets and returns whether its
                 // key is live, which ends the scan.
                 let mut visit = |i: usize| -> bool {
-                    let (key, entry) = &diff[i];
-                    if let Some(live) = written(key) {
-                        return live;
-                    }
-                    if let Some(newer) = resolve_in_diffs(closer, key) {
-                        return matches!(newer, DiffEntry::Active { .. });
-                    }
-                    match entry {
-                        DiffEntry::Active { value, loc, .. } => {
-                            active.push((key, value, *loc));
-                            true
-                        }
-                        DiffEntry::Deleted { .. } => {
-                            deleted.push(key.clone());
-                            false
-                        }
+                    match kinds[i] {
+                        ScanKind::Pass => false,
+                        ScanKind::Stop => true,
+                        ScanKind::Own => match &diff[i] {
+                            (key, DiffEntry::Active { value, loc, .. }) => {
+                                active.push((key, value, *loc));
+                                true
+                            }
+                            (key, DiffEntry::Deleted { .. }) => {
+                                deleted.push(key.clone());
+                                false
+                            }
+                        },
                     }
                 };
                 for &changed in chunk {
