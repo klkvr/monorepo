@@ -2652,6 +2652,8 @@ where
             changed = tracing::field::Empty,
             prev_cached = tracing::field::Empty,
             tip_match = tracing::field::Empty,
+            created = tracing::field::Empty,
+            deleted = tracing::field::Empty,
         );
         // Resolve existing keys.
         let locations = m.gather_existing_locations(&mutations, db, true);
@@ -2792,6 +2794,8 @@ where
         .concat();
         drop(cached_locs);
         resolve_span.record("changed", changed.len() as u64);
+        resolve_span.record("created", created.len() as u64);
+        resolve_span.record("deleted", deleted.len() as u64);
         resolve_span.record("prev_cached", cached_hits.into_inner());
         if let Some(tip_match) = tip_match {
             resolve_span.record("tip_match", tip_match);
