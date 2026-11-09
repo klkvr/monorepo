@@ -36,6 +36,27 @@ use std::{
 use tracing::{Instrument as _, debug};
 
 type DiffVec<K, F, V> = Vec<(K, DiffEntry<F, V>)>;
+
+/// Work a caller runs on a batch's merged diff while its journal merkleizes, given the batch's
+/// ancestor diffs (closest first), its first location, and its operation count (CommitFloor
+/// included). It runs on the strategy inside the diff-merge job and hands the diff back.
+pub(crate) trait DiffHook<F: Family, K, V>:
+    FnOnce(DiffVec<K, F, V>, Vec<Arc<DiffVec<K, F, V>>>, u64, usize) -> DiffVec<K, F, V>
+    + Send
+    + 'static
+{
+}
+
+impl<F: Family, K, V, T> DiffHook<F, K, V> for T where
+    T: FnOnce(DiffVec<K, F, V>, Vec<Arc<DiffVec<K, F, V>>>, u64, usize) -> DiffVec<K, F, V>
+        + Send
+        + 'static
+{
+}
+
+/// The [`DiffHook`] type of callers that pass none.
+pub(crate) type NoDiffHook<F, K, V> =
+    fn(DiffVec<K, F, V>, Vec<Arc<DiffVec<K, F, V>>>, u64, usize) -> DiffVec<K, F, V>;
 type DiffSlice<K, F, V> = [(K, DiffEntry<F, V>)];
 
 /// Sorted locations at the retained batch chain's committed boundary.
@@ -1106,8 +1127,9 @@ where
     /// superseded by `diff` (every `Some` `base_old_loc`), in any order. The floor raise
     /// skips re-reading them. `prefetched` optionally holds committed-prefix candidates the
     /// caller gathered and read ahead of time, consumed by the raise before scanning live.
+    /// `hook` runs on the merged diff while the journal merkleizes (see [`DiffHook`]).
     #[allow(clippy::too_many_arguments)]
-    async fn finish<E, C, I, const N: usize>(
+    async fn finish<E, C, I, Hk, const N: usize>(
         self,
         mut ops: Vec<Operation<F, U>>,
         mut diff: DiffVec<U::Key, F, U::Value>,
@@ -1117,12 +1139,14 @@ where
         metadata: Option<U::Value>,
         mut prefetched: Option<PrefetchedCandidates<F, U>>,
         mut fill_candidates: impl FnMut(Location<F>, u64, usize, &mut Vec<Location<F>>) -> Location<F>,
+        hook: Option<Hk>,
         db: &Db<F, E, C, I, H, U, N, S>,
     ) -> Result<Arc<MerkleizedBatch<F, H::Digest, U, S>>, crate::qmdb::Error<F>>
     where
         E: Context,
         C: Contiguous<Item = Operation<F, U>>,
         I: UnorderedIndex<Value = Location<F>>,
+        Hk: DiffHook<F, U::Key, U::Value>,
     {
         // Floor raise.
         // Steps = user_steps + 1 (+1 for previous commit becoming inactive).
@@ -1359,15 +1383,31 @@ where
         // not already present in `diff` (a key can only be moved once during this floor raise
         // because, after it is moved, its new location lies above `fixed_tip` and the scan
         // never revisits it), so the merge inputs are disjoint.
+        // The hook joins the merge job (or gets one of its own), so it overlaps the hashing too.
+        let ancestor_diffs: Vec<_> = self.ancestors.iter().map(|a| Arc::clone(&a.diff)).collect();
         let mut diff_merge = None;
-        if !floor_diff.is_empty() {
+        if !floor_diff.is_empty() || hook.is_some() {
             let merge_len = floor_diff.len() + diff.len();
+            let batch_base = *self.base_state.size;
+            // The CommitFloor pushed below is the batch's last operation.
+            let batch_len = ops.len() + 1;
+            let hook_diffs = if hook.is_some() {
+                ancestor_diffs.clone()
+            } else {
+                Vec::new()
+            };
             diff_merge = Some(db.strategy().spawn(merge_len, move |strategy| {
-                let mut floor_diff = floor_diff;
-                strategy.sort_by(&mut floor_diff, |a, b| a.0.cmp(&b.0));
-                let diff = merge_sorted_diffs(diff, floor_diff);
-                assert!(diff.is_sorted_by(|a, b| a.0 < b.0));
-                diff
+                let mut diff = diff;
+                if !floor_diff.is_empty() {
+                    let mut floor_diff = floor_diff;
+                    strategy.sort_by(&mut floor_diff, |a, b| a.0.cmp(&b.0));
+                    diff = merge_sorted_diffs(diff, floor_diff);
+                    assert!(diff.is_sorted_by(|a, b| a.0 < b.0));
+                }
+                match hook {
+                    Some(hook) => hook(diff, hook_diffs, batch_base, batch_len),
+                    None => diff,
+                }
             }));
             diff = Vec::new();
         }
@@ -1412,7 +1452,6 @@ where
             .filter_map(|(key, _)| dropped.resolve(key).map(|entry| (key.clone(), entry.loc())))
             .collect()
         });
-        let ancestor_diffs: Vec<_> = self.ancestors.iter().map(|a| Arc::clone(&a.diff)).collect();
         let ancestors: Vec<_> = self
             .ancestors
             .iter()
@@ -2585,6 +2624,7 @@ where
             metadata,
             prefetched,
             fill_candidates,
+            None::<NoDiffHook<F, K, V::Value>>,
             db,
         )
         .await
@@ -2643,13 +2683,42 @@ where
         db: &Db<F, E, C, I, H, update::Ordered<K, V>, N, S>,
         metadata: Option<V::Value>,
         staged_updates: StagedUpdates<F, update::Ordered<K, V>>,
-        mut prefetched: Option<PrefetchedCandidates<F, update::Ordered<K, V>>>,
+        prefetched: Option<PrefetchedCandidates<F, update::Ordered<K, V>>>,
         fill_candidates: impl FnMut(Location<F>, u64, usize, &mut Vec<Location<F>>) -> Location<F>,
     ) -> Result<Arc<MerkleizedBatch<F, H::Digest, update::Ordered<K, V>, S>>, crate::qmdb::Error<F>>
     where
         E: Context,
         C: Mutable<Item = Operation<F, update::Ordered<K, V>>>,
         I: OrderedIndex<Value = Location<F>>,
+    {
+        self.merkleize_with_diff_hook(
+            db,
+            metadata,
+            staged_updates,
+            prefetched,
+            fill_candidates,
+            None::<NoDiffHook<F, K, V::Value>>,
+        )
+        .await
+    }
+
+    /// Like [`merkleize_with_floor_scan`](Self::merkleize_with_floor_scan), running `hook`
+    /// on the merged diff while the journal merkleizes (see [`DiffHook`]).
+    #[allow(clippy::type_complexity)]
+    pub(crate) async fn merkleize_with_diff_hook<E, C, I, Hk, const N: usize>(
+        self,
+        db: &Db<F, E, C, I, H, update::Ordered<K, V>, N, S>,
+        metadata: Option<V::Value>,
+        staged_updates: StagedUpdates<F, update::Ordered<K, V>>,
+        mut prefetched: Option<PrefetchedCandidates<F, update::Ordered<K, V>>>,
+        fill_candidates: impl FnMut(Location<F>, u64, usize, &mut Vec<Location<F>>) -> Location<F>,
+        hook: Option<Hk>,
+    ) -> Result<Arc<MerkleizedBatch<F, H::Digest, update::Ordered<K, V>, S>>, crate::qmdb::Error<F>>
+    where
+        E: Context,
+        C: Mutable<Item = Operation<F, update::Ordered<K, V>>>,
+        I: OrderedIndex<Value = Location<F>>,
+        Hk: DiffHook<F, K, V::Value>,
     {
         let (mut mutations, m) = self.into_parts();
 
@@ -3205,6 +3274,7 @@ where
                 metadata,
                 prefetched,
                 fill_candidates,
+                hook,
                 db,
             )
             .await;
