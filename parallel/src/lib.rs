@@ -95,6 +95,57 @@ commonware_macros::stability_scope!(BETA {
         }
     }
 
+    #[cfg(any(feature = "std", test))]
+    std::thread_local! {
+        /// Set while a [`Serial`] future is polled.
+        static SERIAL: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    }
+
+    /// Whether the current thread is polling a [`Serial`] future.
+    #[cfg(any(feature = "std", test))]
+    fn in_serial_scope() -> bool {
+        SERIAL.with(core::cell::Cell::get)
+    }
+
+    /// A future whose polls run all [`Rayon`] strategy work on the polling thread, built by
+    /// [`serial`].
+    #[cfg(any(feature = "std", test))]
+    pub struct Serial<F> {
+        inner: core::pin::Pin<Box<F>>,
+    }
+
+    /// Runs `future` so that [`Rayon`] strategy work done while polling it (runs, folds, maps,
+    /// sorts, joins and spawned jobs) stays on the polling thread instead of fanning out to the
+    /// pool: for background work that must not compete with the pool's latency-critical users.
+    #[cfg(any(feature = "std", test))]
+    pub fn serial<F: core::future::Future>(future: F) -> Serial<F> {
+        Serial {
+            inner: Box::pin(future),
+        }
+    }
+
+    #[cfg(any(feature = "std", test))]
+    impl<F: core::future::Future> core::future::Future for Serial<F> {
+        type Output = F::Output;
+
+        fn poll(
+            mut self: core::pin::Pin<&mut Self>,
+            cx: &mut core::task::Context<'_>,
+        ) -> core::task::Poll<F::Output> {
+            /// Restores the previous scope, also when the poll panics.
+            struct Restore(bool);
+
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    SERIAL.with(|serial| serial.set(self.0));
+                }
+            }
+
+            let _restore = Restore(SERIAL.with(|serial| serial.replace(true)));
+            self.inner.as_mut().poll(cx)
+        }
+    }
+
     /// A strategy wrapper for manually partitioned work.
     ///
     /// Built via [`Strategy::manual`], this disables adaptive policy decisions (including spawn
@@ -1007,6 +1058,9 @@ commonware_macros::stability_scope!(BETA, cfg(any(feature = "std", test)) {
             multiplier: usize,
             run: impl FnOnce(policy::RunExecution) -> Result<R, E>,
         ) -> Result<R, E> {
+            if in_serial_scope() {
+                return run(policy::RunExecution::Serial);
+            }
             let Some(policy) = &self.policy else {
                 let execution = if self.parallelism <= 1 {
                     policy::RunExecution::Serial
@@ -1043,6 +1097,9 @@ commonware_macros::stability_scope!(BETA, cfg(any(feature = "std", test)) {
             F: FnOnce(Self) -> T + Send + 'static,
             T: Send + 'static,
         {
+            if in_serial_scope() {
+                return Either::Left(future::ready(f(self.clone())));
+            }
             let threads = self.thread_pool.current_num_threads();
             let caller = Location::caller();
 
@@ -1327,6 +1384,9 @@ commonware_macros::stability_scope!(BETA, cfg(any(feature = "std", test)) {
             RA: Send,
             RB: Send,
         {
+            if in_serial_scope() {
+                return (a(), b());
+            }
             self.thread_pool.install(|| rayon::join(a, b))
         }
 
@@ -1351,7 +1411,7 @@ commonware_macros::stability_scope!(ALPHA, cfg(any(feature = "test-utils", test)
 
 #[cfg(test)]
 mod test {
-    use crate::{Rayon, Sequential, Strategy};
+    use crate::{Rayon, Sequential, Strategy, serial};
     use core::num::NonZeroUsize;
     use futures::FutureExt;
     use proptest::prelude::*;
@@ -1909,5 +1969,31 @@ mod test {
             .try_map_collect_vec(0..128, |i| if i == 17 || i == 42 { Err(i) } else { Ok(i) });
 
         assert!(matches!(result, Err(17 | 42)));
+    }
+
+    #[test]
+    fn serial_scope_keeps_work_on_the_polling_thread() {
+        let strategy = Rayon::new(NonZeroUsize::new(4).unwrap()).unwrap();
+        let caller = std::thread::current().id();
+        let items: Vec<u32> = (0..10_000).collect();
+        let threads = futures::executor::block_on(serial(async {
+            let threads = strategy
+                .manual()
+                .map_collect_vec(&items, |_| std::thread::current().id());
+            let spawned = strategy
+                .manual()
+                .spawn(1, |_| std::thread::current().id())
+                .await;
+            (threads, spawned)
+        }));
+        assert!(threads.0.iter().all(|id| *id == caller));
+        assert_eq!(threads.1, caller);
+
+        // Outside the scope, manual work fans out again.
+        let outside = strategy
+            .manual()
+            .spawn(1, |_| std::thread::current().id())
+            .now_or_never();
+        assert!(outside.is_none_or(|id| id != caller));
     }
 }
