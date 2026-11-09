@@ -446,7 +446,7 @@ fn resolve_in_diffs<'a, K: Ord, F: Family, V>(
 /// as its policy decides, returning one output per chunk in order. `f` receives each chunk's
 /// starting index in `items`.
 #[track_caller]
-fn map_chunks<T: Sync, R: Send, S: Strategy>(
+pub(crate) fn map_chunks<T: Sync, R: Send, S: Strategy>(
     strategy: &S,
     items: &[T],
     f: impl Fn(usize, &[T]) -> R + Send + Sync,

@@ -15,7 +15,7 @@ use crate::{
         Error,
         any::{
             self, ValueEncoding,
-            batch::{DiffCursors, DiffEntry, Staged as AnyStaged, StagedUpdates},
+            batch::{DiffEntry, Staged as AnyStaged, StagedUpdates, lookup_sorted, map_chunks},
             operation::{Operation, update},
         },
         batch_chain::Bounds,
@@ -90,19 +90,26 @@ impl<const N: usize> ChunkOverlay<N> {
     /// first access for an existing chunk, reads from `base`.
     fn chunk_mut<B: bitmap::Readable<N>>(&mut self, base: &B, idx: usize) -> &mut [u8; N] {
         let parent = self.parent;
-        self.chunks.entry(idx).or_insert_with(|| {
-            let base_has_partial = !parent.len.is_multiple_of(Self::CHUNK_BITS);
-            if idx < parent.complete_chunks {
-                base.get_chunk(idx)
-            } else if idx == parent.complete_chunks && base_has_partial {
-                base.last_chunk().0
-            } else {
-                bitmap::BitMap::<N>::EMPTY_CHUNK
-            }
-        })
+        self.chunks
+            .entry(idx)
+            .or_insert_with(|| Self::parent_chunk(parent, base, idx))
+    }
+
+    /// The bytes chunk `idx` holds in `base` before any overlay edit: a complete parent chunk,
+    /// the parent's partial last chunk, or an empty chunk past the parent.
+    fn parent_chunk<B: bitmap::Readable<N>>(parent: Dimensions, base: &B, idx: usize) -> [u8; N] {
+        let base_has_partial = !parent.len.is_multiple_of(Self::CHUNK_BITS);
+        if idx < parent.complete_chunks {
+            base.get_chunk(idx)
+        } else if idx == parent.complete_chunks && base_has_partial {
+            base.last_chunk().0
+        } else {
+            bitmap::BitMap::<N>::EMPTY_CHUNK
+        }
     }
 
     /// Set a single bit (used for pushes and active operations).
+    #[cfg(test)]
     fn set_bit<B: bitmap::Readable<N>>(&mut self, base: &B, loc: u64) {
         let idx = bitmap::Prunable::<N>::to_chunk_index(loc);
         let rel = (loc % Self::CHUNK_BITS) as usize;
@@ -112,6 +119,7 @@ impl<const N: usize> ChunkOverlay<N> {
 
     /// Clear a single bit (used for superseded locations). Skips locations in pruned chunks
     /// since those bits are already inactive.
+    #[cfg(test)]
     fn clear_bit<B: bitmap::Readable<N>>(&mut self, base: &B, loc: u64) {
         let idx = bitmap::Prunable::<N>::to_chunk_index(loc);
         if idx < self.parent.pruned_chunks {
@@ -752,7 +760,8 @@ where
 /// search back through ancestors to find the most recent active location; if none exists, we clear
 /// the committed DB location (`base_old_loc`).
 #[allow(clippy::type_complexity)]
-fn build_chunk_overlay<F: Graftable, U, B: bitmap::Readable<N>, const N: usize>(
+fn build_chunk_overlay<F: Graftable, U, B: bitmap::Readable<N> + Sync, const N: usize, S: Strategy>(
+    strategy: &S,
     base: &B,
     batch_len: usize,
     batch_base: u64,
@@ -761,39 +770,87 @@ fn build_chunk_overlay<F: Graftable, U, B: bitmap::Readable<N>, const N: usize>(
 ) -> ChunkOverlay<N>
 where
     U: update::Update,
+    U::Key: Sync,
+    U::Value: Sync,
 {
     let total_bits = base.len() + batch_len as u64;
     let appended_chunks = (batch_len as u64).div_ceil(ChunkOverlay::<N>::CHUNK_BITS) as usize;
     let mut overlay = ChunkOverlay::new(base, total_bits, diff.len() + appended_chunks + 1);
+    let parent = overlay.parent;
+    let batch_end = batch_base + batch_len as u64;
+    let chunk_of = |edit: u64| bitmap::Prunable::<N>::to_chunk_index(edit >> 1);
 
-    // 1. CommitFloor (last op) is always active.
-    let commit_loc = batch_base + batch_len as u64 - 1;
-    overlay.set_bit(base, commit_loc);
-
-    // 2. Inactivate previous CommitFloor.
-    overlay.clear_bit(base, batch_base - 1);
-
-    // 3. Set active bits + clear superseded locations from the diff. The diff is key-sorted,
-    // so ancestor resolution streams (one cursor per ancestor diff).
-    let mut ancestors = DiffCursors::new(ancestor_diffs.iter().map(|d| d.as_slice()));
-    for (key, entry) in diff {
-        // Set the active bit for this key's final location.
-        if let Some(loc) = entry.loc()
-            && *loc >= batch_base
-            && *loc < batch_base + batch_len as u64
-        {
-            overlay.set_bit(base, *loc);
+    // Bit edits, encoded as `loc << 1 | set`. Sets land on this batch's locations and clears on
+    // superseded locations below it, so no bit is both set and cleared and the edits apply in
+    // any order. Clears in pruned chunks are skipped: those bits are already inactive.
+    let clear = |loc: u64, out: &mut Vec<u64>| {
+        if bitmap::Prunable::<N>::to_chunk_index(loc) >= parent.pruned_chunks {
+            out.push(loc << 1);
         }
+    };
 
-        // Clear the most recent superseded location. Older locations were already cleared by the
-        // ancestor batch that superseded them.
-        let mut prev_loc = entry.base_old_loc();
-        if let Some(ancestor_entry) = ancestors.resolve(key) {
-            prev_loc = ancestor_entry.loc();
+    // 1. CommitFloor (last op) is always active. 2. Inactivate the previous CommitFloor.
+    let mut edits = vec![((batch_end - 1) << 1) | 1];
+    clear(batch_base - 1, &mut edits);
+
+    // 3. Set active bits and clear superseded locations from the diff, sharded across the
+    // strategy. Each key's most recent superseded location is its closest ancestor's
+    // location, or its committed `base_old_loc`. Older locations were already cleared by the
+    // ancestor batch that superseded them.
+    let diffs: Vec<&[(U::Key, DiffEntry<F, U::Value>)]> =
+        ancestor_diffs.iter().map(|d| d.as_slice()).collect();
+    for chunk_edits in map_chunks(strategy, diff, |_, chunk| {
+        let mut out = Vec::with_capacity(chunk.len() * 2);
+        for (key, entry) in chunk {
+            if let Some(loc) = entry.loc()
+                && *loc >= batch_base
+                && *loc < batch_end
+            {
+                out.push((*loc << 1) | 1);
+            }
+            let prev_loc = diffs
+                .iter()
+                .find_map(|d| lookup_sorted(d, key))
+                .map_or_else(|| entry.base_old_loc(), DiffEntry::loc);
+            if let Some(old) = prev_loc {
+                clear(*old, &mut out);
+            }
         }
-        if let Some(old) = prev_loc {
-            overlay.clear_bit(base, *old);
+        out
+    }) {
+        edits.extend(chunk_edits);
+    }
+
+    // Group the edits by chunk and materialize each touched chunk from its parent bytes,
+    // sharded across the strategy.
+    strategy.sort_by(&mut edits, |a, b| a.cmp(b));
+    let mut groups = Vec::new();
+    let mut group_start = 0;
+    for i in 1..=edits.len() {
+        if i == edits.len() || chunk_of(edits[i]) != chunk_of(edits[group_start]) {
+            groups.push(group_start..i);
+            group_start = i;
         }
+    }
+    for materialized in map_chunks(strategy, &groups, |_, chunk| {
+        chunk
+            .iter()
+            .map(|group| {
+                let idx = chunk_of(edits[group.start]);
+                let mut bytes = ChunkOverlay::<N>::parent_chunk(parent, base, idx);
+                for &edit in &edits[group.clone()] {
+                    let rel = ((edit >> 1) % ChunkOverlay::<N>::CHUNK_BITS) as usize;
+                    if edit & 1 == 1 {
+                        bytes[rel / 8] |= 1 << (rel % 8);
+                    } else {
+                        bytes[rel / 8] &= !(1 << (rel % 8));
+                    }
+                }
+                (idx, bytes)
+            })
+            .collect::<Vec<_>>()
+    }) {
+        overlay.chunks.extend(materialized);
     }
 
     // Ensure all new complete chunks beyond the parent are materialized, so downstream consumers
@@ -878,7 +935,8 @@ where
 
     // Build chunk overlay: materialized bytes for every dirty chunk.
     let overlay_span = tracing::info_span!("qmdb.current.overlay", chunks = tracing::field::Empty);
-    let overlay = build_chunk_overlay::<F, U, _, N>(
+    let overlay = build_chunk_overlay::<F, U, _, N, _>(
+        &current_db.strategy,
         bitmap_parent,
         batch_len,
         batch_base,
@@ -1424,7 +1482,7 @@ mod tests {
     use crate::{mmb, mmr, utils::detached::block_strategy};
     use commonware_cryptography::Sha256;
     use commonware_macros::test_traced;
-    use commonware_parallel::{Manual, Rayon};
+    use commonware_parallel::{Manual, Rayon, Sequential};
     use commonware_utils::{NZUsize, bitmap::Prunable as BitMap};
     use std::{
         future::Future as _,
@@ -1560,7 +1618,7 @@ mod tests {
         ];
         diff.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let overlay = build_chunk_overlay::<mmr::Family, U, _, N>(&base, 4, 4, &diff, &[]);
+        let overlay = build_chunk_overlay::<mmr::Family, U, _, N, _>(&Sequential, &base, 4, 4, &diff, &[]);
 
         // Chunk 0 should have: bits 0-3 from base (all set), bit 4 set (key1), bits 5-6 false
         // (inactive), bit 7 set (CommitFloor at loc 7). Also bit 3 cleared (previous commit).
@@ -1614,7 +1672,7 @@ mod tests {
         diff.sort_by(|a, b| a.0.cmp(&b.0));
 
         // Segment of 8 ops starting at 64; previous commit at loc 63.
-        let overlay = build_chunk_overlay::<mmr::Family, U, _, N>(&base, 8, 64, &diff, &[]);
+        let overlay = build_chunk_overlay::<mmr::Family, U, _, N, _>(&Sequential, &base, 8, 64, &diff, &[]);
 
         // Verify bits 5 and 10 are cleared in chunk 0.
         let c0 = overlay.get(0).expect("chunk 0 should be dirty");
@@ -1655,7 +1713,7 @@ mod tests {
         )];
         diff.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let overlay = build_chunk_overlay::<mmr::Family, U, _, N>(&base, 20, 20, &diff, &[]);
+        let overlay = build_chunk_overlay::<mmr::Family, U, _, N, _>(&Sequential, &base, 20, 20, &diff, &[]);
 
         // Chunk 0 should be materialized and preserve the parent's first 20 bits.
         let c0 = overlay.get(0).expect("chunk 0 should be in overlay");
