@@ -31,10 +31,7 @@ use ahash::AHashMap;
 use commonware_codec::Codec;
 use commonware_cryptography::{Digest, Hasher};
 use commonware_parallel::Strategy;
-use commonware_utils::{
-    bitmap::{self, Readable as _},
-    sync::Mutex,
-};
+use commonware_utils::bitmap::{self, Readable as _};
 use core::ops::Range;
 use std::sync::Arc;
 use tracing::Instrument as _;
@@ -563,7 +560,7 @@ where
                 |floor, tip, limit, out| fill_candidates(&bitmap_parent, floor, tip, limit, out),
             )
             .await?;
-        compute_current_layer(inner, db, &grafted_parent, &bitmap_parent, None).await
+        compute_current_layer(inner, db, &grafted_parent, &bitmap_parent).await
     }
 }
 
@@ -634,45 +631,16 @@ where
             })
             .await?;
 
-        // Build the chunk overlay inside the diff-merge job, overlapping the journal
-        // merkleization, rather than after it.
-        let overlay_slot = Arc::new(Mutex::new(None));
-        let hook = {
-            let slot = Arc::clone(&overlay_slot);
-            let bitmap = bitmap_parent.clone();
-            let parent_span = tracing::Span::current();
-            move |diff: Vec<_>, ancestor_diffs: Vec<_>, batch_base: u64, batch_len: usize| {
-                let overlay_span = tracing::info_span!(
-                    parent: &parent_span,
-                    "qmdb.current.overlay",
-                    chunks = tracing::field::Empty
-                );
-                let _overlay = overlay_span.enter();
-                let overlay = build_chunk_overlay::<F, update::Ordered<K, V>, _, N>(
-                    &bitmap,
-                    batch_len,
-                    batch_base,
-                    &diff,
-                    &ancestor_diffs,
-                );
-                overlay_span.record("chunks", overlay.chunks.len() as u64);
-                *slot.lock() = Some(overlay);
-                diff
-            }
-        };
-        let merkleize = inner.merkleize_with_diff_hook(
+        let merkleize = inner.merkleize_with_floor_scan(
             &db.any,
             metadata,
             staged_updates,
             Some(prefetched),
             |floor, tip, limit, out| fill_candidates(&bitmap_parent, floor, tip, limit, out),
-            Some(hook),
         );
         let inner = merkleize.await?;
-        let overlay = overlay_slot.lock().take();
         let layer_span = tracing::info_span!("qmdb.current.layer");
-        let result =
-            compute_current_layer(inner, db, &grafted_parent, &bitmap_parent, overlay).await;
+        let result = compute_current_layer(inner, db, &grafted_parent, &bitmap_parent).await;
         drop(layer_span);
         result
     }
@@ -720,7 +688,7 @@ where
             )
             .await?;
         let layer_span = tracing::info_span!("qmdb.current.layer");
-        let result = compute_current_layer(inner, db, &grafted_parent, &bitmap_parent, None).await;
+        let result = compute_current_layer(inner, db, &grafted_parent, &bitmap_parent).await;
         drop(layer_span);
         result
     }
@@ -768,7 +736,7 @@ where
             )
             .await?;
         let layer_span = tracing::info_span!("qmdb.current.layer");
-        let result = compute_current_layer(inner, db, &grafted_parent, &bitmap_parent, None).await;
+        let result = compute_current_layer(inner, db, &grafted_parent, &bitmap_parent).await;
         drop(layer_span);
         result
     }
@@ -894,7 +862,6 @@ async fn compute_current_layer<F, E, U, C, I, H, const N: usize, S>(
     current_db: &super::db::Db<F, E, C, I, H, U, N, S>,
     grafted_parent: &Arc<merkle::batch::MerkleizedBatch<F, H::Digest, S>>,
     bitmap_parent: &BitmapBatch<N>,
-    overlay: Option<ChunkOverlay<N>>,
 ) -> Result<Arc<MerkleizedBatch<F, H::Digest, U, N, S>>, Error<F>>
 where
     F: Graftable,
@@ -909,22 +876,17 @@ where
     let batch_len = inner.journal_batch.items().len();
     let batch_base = *inner.bounds.tip.size - batch_len as u64;
 
-    // Build chunk overlay: materialized bytes for every dirty chunk, unless the caller built it
-    // from the same diff while the journal merkleized.
-    let overlay = overlay.unwrap_or_else(|| {
-        let overlay_span =
-            tracing::info_span!("qmdb.current.overlay", chunks = tracing::field::Empty);
-        let overlay = build_chunk_overlay::<F, U, _, N>(
-            bitmap_parent,
-            batch_len,
-            batch_base,
-            &inner.diff,
-            &inner.ancestor_diffs,
-        );
-        overlay_span.record("chunks", overlay.chunks.len() as u64);
-        overlay
-    });
-    assert_eq!(overlay.len, bitmap_parent.len() + batch_len as u64);
+    // Build chunk overlay: materialized bytes for every dirty chunk.
+    let overlay_span = tracing::info_span!("qmdb.current.overlay", chunks = tracing::field::Empty);
+    let overlay = build_chunk_overlay::<F, U, _, N>(
+        bitmap_parent,
+        batch_len,
+        batch_base,
+        &inner.diff,
+        &inner.ancestor_diffs,
+    );
+    overlay_span.record("chunks", overlay.chunks.len() as u64);
+    drop(overlay_span);
 
     let grafting_height = grafting::height::<N>();
     let ops_tree_adapter =
