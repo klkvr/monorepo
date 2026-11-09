@@ -100,8 +100,89 @@ use commonware_cryptography::Digest;
 use commonware_parallel::{Sequential, Strategy};
 use core::ops::Range;
 
-/// Overwritten node digests keyed by position.
-pub(crate) type Overwrites<F, D> = hashbrown::HashMap<Position<F>, D, RandomState>;
+/// Overwritten node digests keyed by position, split into shards by position so a large
+/// batch of nodes inserts on several threads at once.
+#[derive(Debug)]
+pub(crate) struct Overwrites<F: Family, D> {
+    shards: Vec<hashbrown::HashMap<Position<F>, D, RandomState>>,
+}
+
+impl<F: Family, D> Default for Overwrites<F, D> {
+    fn default() -> Self {
+        Self {
+            shards: (0..OVERWRITE_SHARDS).map(|_| hashbrown::HashMap::default()).collect(),
+        }
+    }
+}
+
+/// Number of [`Overwrites`] shards; a power of two.
+const OVERWRITE_SHARDS: usize = 16;
+
+/// Fewest nodes [`Overwrites::extend_below`] inserts in parallel.
+const PARALLEL_OVERWRITES: usize = 8192;
+
+impl<F: Family, D: Copy + Send + Sync> Overwrites<F, D> {
+    /// The shard holding `pos`.
+    fn shard(pos: Position<F>) -> usize {
+        ((*pos).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - OVERWRITE_SHARDS.trailing_zeros()))
+            as usize
+    }
+
+    /// The digest overwritten at `pos`, if any.
+    pub(crate) fn get(&self, pos: &Position<F>) -> Option<&D> {
+        self.shards[Self::shard(*pos)].get(pos)
+    }
+
+    /// Overwrite the digest at `pos`.
+    pub(crate) fn insert(&mut self, pos: Position<F>, digest: D) {
+        self.shards[Self::shard(pos)].insert(pos, digest);
+    }
+
+    /// Whether no digest is overwritten.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.shards.iter().all(|shard| shard.is_empty())
+    }
+
+    /// Every overwritten position and digest, in no particular order.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&Position<F>, &D)> {
+        self.shards.iter().flat_map(|shard| shard.iter())
+    }
+
+    /// Insert every node of `nodes` below `below`, filling the shards on `strategy` when there
+    /// are enough of them.
+    fn extend_below<S: Strategy>(
+        &mut self,
+        strategy: &S,
+        nodes: &[Vec<(Position<F>, D)>],
+        below: Position<F>,
+    ) {
+        let count: usize = nodes
+            .iter()
+            .map(|nodes| nodes.partition_point(|&(pos, _)| pos < below))
+            .sum();
+        if count < PARALLEL_OVERWRITES {
+            for &(pos, digest) in nodes.iter().flatten() {
+                if pos < below {
+                    self.insert(pos, digest);
+                }
+            }
+            return;
+        }
+        let shards: Vec<_> = core::mem::take(&mut self.shards).into_iter().enumerate().collect();
+        let per_shard = count / OVERWRITE_SHARDS + count / (4 * OVERWRITE_SHARDS);
+        let mut filled = strategy.map_collect_vec(shards, |(idx, mut shard)| {
+            shard.reserve(per_shard);
+            for &(pos, digest) in nodes.iter().flatten() {
+                if pos < below && Self::shard(pos) == idx {
+                    shard.insert(pos, digest);
+                }
+            }
+            (idx, shard)
+        });
+        filled.sort_unstable_by_key(|&(idx, _)| idx);
+        self.shards = filled.into_iter().map(|(_, shard)| shard).collect();
+    }
+}
 
 /// Each peak of a tree of `size` nodes, with its height and its first leaf.
 fn peak_ranges<F: Family>(size: Position<F>) -> Vec<(Position<F>, u32, Location<F>)> {
@@ -243,6 +324,19 @@ impl<F: Family, D: Digest, S: Strategy> UnmerkleizedBatch<F, D, S> {
         } else {
             self.overwrites.insert(pos, digest);
         }
+    }
+
+    /// Store every digest of `nodes`, each list ascending by position, inserting overwrites on
+    /// the batch's strategy when there are many.
+    fn store_nodes(&mut self, nodes: &[Vec<(Position<F>, D)>]) {
+        let parent_size = self.parent.size();
+        for &(pos, digest) in nodes.iter().flatten() {
+            if pos >= parent_size {
+                self.appended[(*pos - *parent_size) as usize] = digest;
+            }
+        }
+        let strategy = self.parent.strategy.clone();
+        self.overwrites.extend_below(&strategy, nodes, parent_size);
     }
 
     /// Mark ancestors of the leaf at `loc` as dirty up to its peak.
@@ -411,10 +505,9 @@ impl<F: Family, D: Digest, S: Strategy> UnmerkleizedBatch<F, D, S> {
             }
             (nodes, dirty)
         });
-        for (nodes, dirty) in marked {
-            for (pos, digest) in nodes {
-                self.store_node(pos, digest);
-            }
+        let (nodes, dirty): (Vec<_>, Vec<_>) = marked.into_iter().unzip();
+        self.store_nodes(&nodes);
+        for dirty in dirty {
             if self.dirty_nodes.len() < dirty.len() {
                 self.dirty_nodes.resize_with(dirty.len(), Vec::new);
             }
@@ -455,14 +548,7 @@ impl<F: Family, D: Digest, S: Strategy> UnmerkleizedBatch<F, D, S> {
             bucket.sort();
             bucket.dedup();
         }
-        // Reserve for every dirty node at once: growing the overwrite map node by node rehashes
-        // it repeatedly. Appended nodes are stored elsewhere, so this can over-reserve.
         let parent_size = self.parent.size();
-        let overwritten = buckets
-            .iter()
-            .map(|bucket| bucket.partition_point(|&pos| pos < parent_size))
-            .sum();
-        self.overwrites.reserve(overwritten);
         for (height, positions) in buckets.iter().enumerate() {
             if positions.is_empty() {
                 continue;
@@ -550,11 +636,7 @@ impl<F: Family, D: Digest, S: Strategy> UnmerkleizedBatch<F, D, S> {
                     computed
                 },
             );
-        for nodes in computed {
-            for (pos, digest) in nodes {
-                self.store_node(pos, digest);
-            }
-        }
+        self.store_nodes(&computed);
     }
 }
 
