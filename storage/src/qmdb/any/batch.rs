@@ -336,10 +336,6 @@ where
     prev_tip: Option<u64>,
     /// How many staged keys `prefetch_predecessors` has visited.
     prev_scanned: usize,
-    /// Keys the block is expected to delete, from [`hint_deletes`](Staged::hint_deletes).
-    deletes: Vec<U::Key>,
-    /// How many of `deletes` `prefetch_predecessors` has visited.
-    deletes_scanned: usize,
 }
 
 /// A speculative batch of operations whose root digest has been computed,
@@ -1619,8 +1615,6 @@ where
             prev_locs: _,
             prev_tip: _,
             prev_scanned: _,
-            deletes: _,
-            deletes_scanned: _,
         } = self;
         let mut staged_updates = StagedUpdates::<F, U>::new();
         if updates.is_empty() {
@@ -1855,13 +1849,6 @@ where
     H: Hasher,
     Operation<F, update::Ordered<K, V>>: Codec,
 {
-    /// Queue `keys`, which the block is expected to delete, for the next
-    /// [`prefetch_predecessors`](Staged::prefetch_predecessors) to read the predecessors of.
-    /// A hint the block's final writes do not delete only costs that read.
-    pub fn hint_deletes(&mut self, keys: impl IntoIterator<Item = K>) {
-        self.deletes.extend(keys);
-    }
-
     /// Reads the committed predecessors of staged keys that read as absent, which a write would
     /// create, ahead of [`merkleize`](Staged::merkleize), whose predecessor search then reads
     /// only the predecessors it needs past them.
@@ -1885,18 +1872,13 @@ where
             self.prev_tip = Some(committed);
             self.prev_locs.clear();
             self.prev_scanned = 0;
-            self.deletes_scanned = 0;
         }
         let start = mem::replace(&mut self.prev_scanned, self.keys.len());
-        let deletes_start = mem::replace(&mut self.deletes_scanned, self.deletes.len());
-        // Deleting a key rewrites its predecessor like creating one does, so hinted deletes
-        // join the keys that read as absent.
         let absent: Vec<&K> = self.keys[start..]
             .iter()
             .zip(&self.resolutions[start..])
             .filter(|(_, resolution)| resolution.is_none())
             .map(|(key, _)| key)
-            .chain(&self.deletes[deletes_start..])
             .collect();
         let mut positions: Vec<u64> = Vec::new();
         for &key in &absent {
@@ -2288,8 +2270,6 @@ where
                 prev_locs: AHashMap::new(),
                 prev_tip: None,
                 prev_scanned: 0,
-                deletes: Vec::new(),
-                deletes_scanned: 0,
             },
         ))
     }
@@ -2842,42 +2822,6 @@ where
             .collect();
         prev_span.record("uncached", uncached.len() as u64);
         prev_span.record("staged_ops", prev_ops.len() as u64);
-        let mut read = m
-            .read_ops_sharded(&uncached, &[], &db.log)
-            .await?
-            .into_iter()
-            .flatten();
-        let prev_results: Vec<_> = prev_locations
-            .iter()
-            .map(|loc| {
-                prev_ops
-                    .get(loc)
-                    .cloned()
-                    .unwrap_or_else(|| read.next().expect("one read per uncached predecessor"))
-            })
-            .collect();
-        let prev_stale = stale_mask(strategy, &diffs, &prev_results, &prev_locations, ordered_key);
-        drop(prev_span);
-
-        next_candidates.reserve(prev_results.len());
-        prev_candidates.reserve(prev_results.len());
-        for ((op, &old_loc), stale) in prev_results.into_iter().zip(&prev_locations).zip(prev_stale) {
-            let data = match op {
-                Operation::Update(data) => data,
-                _ => unreachable!("expected update operation"),
-            };
-
-            // Same stale-location guard as the mutation classifier above: the snapshot scan
-            // sees only applied state, so a key the ancestor diff supersedes at another
-            // location (or deletes) is stale here and must not steer the predecessor search.
-            // The ancestor-diff walk below contributes the live version of such keys.
-            if stale {
-                continue;
-            }
-            next_candidates.push(data.next_key);
-            prev_candidates.push((data.key, (Some(data.value), old_loc)));
-        }
-
         // Add ancestor-diff keys that may be predecessors or successors of this batch's created
         // and deleted keys but are invisible to the base-DB-only `prev_translated_key` lookup
         // above.
@@ -2986,12 +2930,46 @@ where
         ancestors_span.record("changed", changed_keys.len() as u64);
         ancestors_span.record("active", ancestor_active.len() as u64);
         ancestors_span.record("reads", ancestor_locs.len() as u64);
-        let mut read = m
-            .read_ops_sharded(&ancestor_locs, &[], &db.log)
-            .instrument(tracing::info_span!("qmdb.ordered.ancestors.read"))
-            .await?
-            .into_iter()
-            .flatten();
+        // Neither read depends on the other, so they run together: the ancestor scan only needs
+        // the changed keys and the staged predecessors, not the reads above.
+        let (prev_read, ancestor_read) = futures::try_join!(
+            m.read_ops_sharded(&uncached, &[], &db.log),
+            m.read_ops_sharded(&ancestor_locs, &[], &db.log)
+                .instrument(tracing::info_span!("qmdb.ordered.ancestors.read")),
+        )?;
+        let mut read = prev_read.into_iter().flatten();
+        let prev_results: Vec<_> = prev_locations
+            .iter()
+            .map(|loc| {
+                prev_ops
+                    .get(loc)
+                    .cloned()
+                    .unwrap_or_else(|| read.next().expect("one read per uncached predecessor"))
+            })
+            .collect();
+        let prev_stale = stale_mask(strategy, &diffs, &prev_results, &prev_locations, ordered_key);
+        drop(prev_span);
+
+        next_candidates.reserve(prev_results.len());
+        prev_candidates.reserve(prev_results.len());
+        for ((op, &old_loc), stale) in prev_results.into_iter().zip(&prev_locations).zip(prev_stale) {
+            let data = match op {
+                Operation::Update(data) => data,
+                _ => unreachable!("expected update operation"),
+            };
+
+            // Same stale-location guard as the mutation classifier above: the snapshot scan
+            // sees only applied state, so a key the ancestor diff supersedes at another
+            // location (or deletes) is stale here and must not steer the predecessor search.
+            // The ancestor-diff walk below contributes the live version of such keys.
+            if stale {
+                continue;
+            }
+            next_candidates.push(data.next_key);
+            prev_candidates.push((data.key, (Some(data.value), old_loc)));
+        }
+
+        let mut read = ancestor_read.into_iter().flatten();
         let ancestor_ops: Vec<_> = ancestor_active
             .iter()
             .map(|(_, _, loc)| {
@@ -4769,8 +4747,6 @@ mod tests {
             prev_locs: AHashMap::new(),
             prev_tip: None,
             prev_scanned: 0,
-            deletes: Vec::new(),
-            deletes_scanned: 0,
         }
     }
 
