@@ -2022,12 +2022,19 @@ where
         // candidates (a translated-key collision, or a key an ancestor already deleted) are
         // dropped by the raise once it moves enough ops, and a shortfall (a write resolving
         // only through an ancestor diff) makes the raise fall back to the live scan when
-        // the prefetched prefix runs out.
-        let resolved_updates = updates
-            .iter()
-            .filter(|(slot, _)| self.resolutions.get(*slot).is_some_and(Option::is_some))
-            .count()
-            .min(self.keys.len());
+        // the prefetched prefix runs out. Each create or delete also rewrites at most one
+        // predecessor, which consumes a step too, so creates and deletes add one each.
+        let mut resolved_updates = 0usize;
+        let mut predecessor_rewrites = 0usize;
+        for (slot, value) in &updates {
+            if self.resolutions.get(*slot).is_some_and(Option::is_some) {
+                resolved_updates += 1;
+                predecessor_rewrites += usize::from(value.is_none());
+            } else {
+                predecessor_rewrites += usize::from(value.is_some());
+            }
+        }
+        let resolved_updates = resolved_updates.min(self.keys.len());
         // The writes' snapshot probes run while the resolution job below runs.
         let write_keys: Vec<K> = upserts
             .iter()
@@ -2062,8 +2069,10 @@ where
         })
         .into_iter()
         .sum();
+        // Writes to keys missing from the snapshot are creates.
+        predecessor_rewrites += write_keys.len() - existing_writes;
         drop(write_keys);
-        let steps_bound = resolved_updates + existing_writes + 1;
+        let steps_bound = resolved_updates + existing_writes + predecessor_rewrites + 1;
 
         // Gather the committed-prefix candidates past those staged ahead and read their
         // operations, sharded, while the resolution job runs. Staged candidates beyond the
