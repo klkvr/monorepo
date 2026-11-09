@@ -572,12 +572,6 @@ where
     H: Hasher,
     Operation<F, update::Ordered<K, V>>: Codec,
 {
-    /// Queue `keys`, which the block is expected to delete, for the next
-    /// [`prefetch_predecessors`](Staged::prefetch_predecessors) to read the predecessors of.
-    pub fn hint_deletes(&mut self, keys: impl IntoIterator<Item = K>) {
-        self.inner.hint_deletes(keys);
-    }
-
     /// Reads the committed predecessors of staged keys that read as absent, which a write would
     /// create, ahead of [`merkleize`](Staged::merkleize), so that its predecessor search reads
     /// only those it needs past them. Each call visits only the keys staged since the last one.
