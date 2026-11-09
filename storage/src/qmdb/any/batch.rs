@@ -2651,6 +2651,7 @@ where
             depth = m.ancestors.len() as u64,
             changed = tracing::field::Empty,
             prev_cached = tracing::field::Empty,
+            tip_match = tracing::field::Empty,
         );
         // Resolve existing keys.
         let locations = m.gather_existing_locations(&mutations, db, true);
@@ -2765,6 +2766,9 @@ where
         // Predecessor locations looked up while the block executed hold while no batch has been
         // applied since.
         let committed_tip = bitmap::Readable::<N>::len(&*db.bitmap);
+        let tip_match = prefetched
+            .as_ref()
+            .map(|pf| u64::from(pf.prev_tip == Some(committed_tip)));
         let cached_locs = prefetched
             .as_mut()
             .filter(|pf| pf.prev_tip == Some(committed_tip))
@@ -2789,12 +2793,19 @@ where
         drop(cached_locs);
         resolve_span.record("changed", changed.len() as u64);
         resolve_span.record("prev_cached", cached_hits.into_inner());
+        if let Some(tip_match) = tip_match {
+            resolve_span.record("tip_match", tip_match);
+        }
         strategy.sort_by(&mut prev_locations, |a, b| a.cmp(b));
         prev_locations.dedup();
 
         drop(resolve_span);
-        let prev_span =
-            tracing::info_span!("qmdb.ordered.prev_reads", ops = prev_locations.len() as u64);
+        let prev_span = tracing::info_span!(
+            "qmdb.ordered.prev_reads",
+            ops = prev_locations.len() as u64,
+            uncached = tracing::field::Empty,
+            staged_ops = tracing::field::Empty,
+        );
         // Predecessors staged ahead skip the read. `prev_locations` ascends, so the rest do too.
         let prev_ops = prefetched
             .as_mut()
@@ -2805,6 +2816,8 @@ where
             .filter(|loc| !prev_ops.contains_key(*loc))
             .copied()
             .collect();
+        prev_span.record("uncached", uncached.len() as u64);
+        prev_span.record("staged_ops", prev_ops.len() as u64);
         let mut read = m
             .read_ops_sharded(&uncached, &[], &db.log)
             .await?
