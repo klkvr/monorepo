@@ -2868,7 +2868,13 @@ where
         // ancestor's scan, which stops at or before it when it is live, so each key contributes
         // only its newest entry, like a closest-first walk. Deleted keys met on the way are
         // collected so the candidate sets drop them.
-        let ancestors_span = tracing::info_span!("qmdb.ordered.ancestors");
+        let ancestors_span = tracing::info_span!(
+            "qmdb.ordered.ancestors",
+            changed = tracing::field::Empty,
+            active = tracing::field::Empty,
+            reads = tracing::field::Empty,
+        );
+        let scan_span = tracing::info_span!("qmdb.ordered.ancestors.scan");
         let mut changed_keys: Vec<&K> = deleted
             .iter()
             .map(|(k, _)| k)
@@ -2945,6 +2951,7 @@ where
         ancestor_active.dedup_by(|a, b| a.0 == b.0);
         ancestor_deleted.sort();
         ancestor_deleted.dedup();
+        drop(scan_span);
 
         // Batch-read the collected active entries' ops and emit their candidates.
         let ancestor_locs: Vec<Location<F>> = ancestor_active
@@ -2952,8 +2959,12 @@ where
             .map(|&(_, _, loc)| loc)
             .filter(|loc| !prev_ops.contains_key(loc))
             .collect();
+        ancestors_span.record("changed", changed_keys.len() as u64);
+        ancestors_span.record("active", ancestor_active.len() as u64);
+        ancestors_span.record("reads", ancestor_locs.len() as u64);
         let mut read = m
             .read_ops_sharded(&ancestor_locs, &[], &db.log)
+            .instrument(tracing::info_span!("qmdb.ordered.ancestors.read"))
             .await?
             .into_iter()
             .flatten();
