@@ -50,7 +50,7 @@ use std::{
     iter, mem,
     sync::{Arc, Weak},
 };
-use tracing::debug;
+use tracing::{Instrument as _, debug};
 
 type DiffVec<K, F, V> = Vec<(K, DiffEntry<F, V>)>;
 type DiffSlice<K, F, V> = [(K, DiffEntry<F, V>)];
@@ -2624,7 +2624,11 @@ where
         let mut neighbors: Neighbors<K, (Cow<'_, V::Value>, Location<F>)> = Neighbors::new();
         let mut deleted: Vec<(K, Location<F>)> = Vec::new();
         let mut updated: Vec<(K, V::Value, Location<F>)> = Vec::new();
-        for (update, old_loc) in m.read_live(&locations, &db.log).await? {
+        let live = m
+            .read_live(&locations, &db.log)
+            .instrument(tracing::info_span!("qmdb.ordered.read_existing", locations = locations.len() as u64))
+            .await?;
+        for (update, old_loc) in live {
             let update::Ordered {
                 key,
                 value,
@@ -2687,7 +2691,11 @@ where
 
         // Those updates may precede the created and deleted keys, and their successors may
         // follow the created keys.
-        for (update, old_loc) in m.read_live(&prev_locations, &db.log).await? {
+        let live = m
+            .read_live(&prev_locations, &db.log)
+            .instrument(tracing::info_span!("qmdb.ordered.read_predecessors", locations = prev_locations.len() as u64))
+            .await?;
+        for (update, old_loc) in live {
             neighbors.next.push(update.next_key);
             neighbors
                 .prev
@@ -2851,14 +2859,20 @@ where
         // merge.
         let (floor, decided) = m
             .walk(&mut walked, superseded_locs, policy, prefetched, source, db)
+            .instrument(tracing::info_span!("qmdb.ordered.floor_walk"))
             .await?;
-        let decided = m.repair_links(&walked, decided, db).await?;
+        let decided = m
+            .repair_links(&walked, decided, db)
+            .instrument(tracing::info_span!("qmdb.ordered.repair_links"))
+            .await?;
         walked.ops.reserve(decided.len() + 1);
         walked.floor_diff.reserve(decided.len());
         for decided in decided {
             m.emit(&mut walked, decided);
         }
-        m.finish(walked, floor, metadata, db).await
+        m.finish(walked, floor, metadata, db)
+            .instrument(tracing::info_span!("qmdb.ordered.finish"))
+            .await
     }
 }
 

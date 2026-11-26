@@ -3,6 +3,7 @@
 //! Wraps the [`any::batch`] API.
 
 pub use crate::qmdb::any::batch::Slot;
+use tracing::Instrument as _;
 use crate::{
     Context,
     index::Unordered as UnorderedIndex,
@@ -586,12 +587,17 @@ where
             bitmap_parent,
         } = self;
         bitmap_parent.ensure_based_on(&db.any.bitmap)?;
-        let (inner, staged) = inner.resolve_updates(slots, unstaged, db.any.strategy());
-        let prepared = inner.prepare(&db.any)?;
+        let (inner, staged) = tracing::info_span!("qmdb.ordered.resolve")
+            .in_scope(|| inner.resolve_updates(slots, unstaged, db.any.strategy()));
+        let prepared =
+            tracing::info_span!("qmdb.ordered.prepare").in_scope(|| inner.prepare(&db.any))?;
         let inner = prepared
             .walk_floor_and_merkleize(staged, &bitmap_parent, policy)
+            .instrument(tracing::info_span!("qmdb.ordered.walk_and_merkleize"))
             .await?;
-        compute_current_layer(inner, db, &grafted_parent, &bitmap_parent).await
+        compute_current_layer(inner, db, &grafted_parent, &bitmap_parent)
+            .instrument(tracing::info_span!("qmdb.ordered.current_layer"))
+            .await
     }
 }
 
