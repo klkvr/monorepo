@@ -322,6 +322,35 @@ where
         self.active_keys == 0
     }
 
+    /// Read into the page cache the active operations a batch's inactivity-floor walk reads
+    /// first: the `count` active locations at or above the floor that follow the first `skip`.
+    ///
+    /// Changes nothing, so callers may read ahead of a batch they are still assembling.
+    pub async fn prefetch_floor(
+        &self,
+        skip: usize,
+        count: usize,
+    ) -> Result<(), crate::qmdb::Error<F>> {
+        use crate::qmdb::bitmap::Candidates as _;
+        let Some(limit) = skip.checked_add(count).filter(|_| count > 0) else {
+            return Ok(());
+        };
+        let size = *self.log.size();
+        let mut candidates = Vec::with_capacity(limit);
+        let mut source = self.bitmap.as_ref();
+        source.fill(self.inactivity_floor_loc, size, limit, &mut candidates);
+        let positions: Vec<u64> = candidates
+            .iter()
+            .skip(skip)
+            .map(|loc| **loc)
+            .filter(|loc| *loc < size)
+            .collect();
+        if !positions.is_empty() {
+            self.log.read_many(&positions).await?;
+        }
+        Ok(())
+    }
+
     /// Get the metadata associated with the last commit.
     pub async fn get_metadata(&self) -> Result<Option<U::Value>, crate::qmdb::Error<F>> {
         // The log always ends with a commit operation.

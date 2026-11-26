@@ -323,6 +323,12 @@ where
         self.any.get_metadata().await
     }
 
+    /// Read into the page cache the active operations a batch's inactivity-floor walk reads
+    /// first, skipping the first `skip` of them. See `any::Db::prefetch_floor`.
+    pub async fn prefetch_floor(&self, skip: usize, count: usize) -> Result<(), Error<F>> {
+        self.any.prefetch_floor(skip, count).await
+    }
+
     /// Batch read multiple keys, returning results in the same order as the input keys.
     pub async fn get_many(
         &self,
