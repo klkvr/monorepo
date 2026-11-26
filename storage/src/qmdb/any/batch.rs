@@ -2737,22 +2737,74 @@ where
         // advances three cursors in a sorted merge instead of three binary searches per key.
         let changes_membership = !created.is_empty() || !deleted.is_empty();
         if changes_membership {
-            let mut shadow = Shadow::new(m.ancestors.iter().map(|a| a.diff.as_slice()));
-            for batch in &m.ancestors {
-                let (mut ui, mut ci, mut di) = (0, 0, 0);
-                for (key, loc) in shadow.updates(&batch.diff) {
-                    if sorted_contains_by(&updated, &mut ui, key, |(k, ..)| k)
-                        || sorted_contains_by(&created, &mut ci, key, |(k, ..)| k)
-                        || sorted_contains_by(&deleted, &mut di, key, |(k, _)| k)
-                    {
-                        continue;
+            // Only the live neighbors of created and deleted keys can change an operation this
+            // batch writes, so each ancestor diff is scanned outward from every such key, stopping
+            // at the first live key on each side, rather than walked whole: the ancestors hold
+            // every unpersisted block's writes, far more than one batch's neighbors. A key is
+            // live when this batch writes it, or when its nearest ancestor entry is active and
+            // this batch does not delete it. A key a nearer ancestor holds is left to that
+            // ancestor's scan, which stops at or before it when it is live, so each key
+            // contributes only its newest entry.
+            let mut changed: Vec<&K> = deleted
+                .iter()
+                .map(|(k, _)| k)
+                .chain(created.iter().map(|(k, ..)| k))
+                .collect();
+            changed.sort_unstable();
+            let written = |key: &K| -> Option<bool> {
+                if updated.binary_search_by(|(k, ..)| k.cmp(key)).is_ok()
+                    || created.binary_search_by(|(k, ..)| k.cmp(key)).is_ok()
+                {
+                    Some(true)
+                } else if deleted.binary_search_by(|(k, _)| k.cmp(key)).is_ok() {
+                    Some(false)
+                } else {
+                    None
+                }
+            };
+            let mut seen: AHashSet<&K> = AHashSet::new();
+            for (depth, batch) in m.ancestors.iter().enumerate() {
+                let diff = batch.diff.as_slice();
+                let nearer = &m.ancestors[..depth];
+                let mut visit = |i: usize| -> bool {
+                    let (key, entry) = &diff[i];
+                    if let Some(live) = written(key) {
+                        return live;
                     }
-                    let data = batch.update_at(loc);
-                    neighbors.next.push(data.key.clone());
-                    neighbors.next.push(data.next_key.clone());
-                    neighbors
-                        .prev
-                        .push((data.key.clone(), Some((Cow::Borrowed(&data.value), loc))));
+                    if let Some(newer) = nearer
+                        .iter()
+                        .find_map(|a| lookup_sorted(a.diff.as_slice(), key))
+                    {
+                        return newer.loc().is_some();
+                    }
+                    let Some(loc) = entry.loc() else {
+                        return false;
+                    };
+                    if seen.insert(key) {
+                        let data = batch.update_at(loc);
+                        neighbors.next.push(data.key.clone());
+                        neighbors.next.push(data.next_key.clone());
+                        neighbors
+                            .prev
+                            .push((data.key.clone(), Some((Cow::Borrowed(&data.value), loc))));
+                    }
+                    true
+                };
+                for &key in &changed {
+                    let below = diff.partition_point(|(k, _)| k < key);
+                    let above = below + usize::from(diff.get(below).is_some_and(|(k, _)| k == key));
+                    // Keys form a cycle, the last key's next key being the first, so each scan
+                    // wraps around the diff's ends.
+                    for i in (0..below).rev().chain((above..diff.len()).rev()) {
+                        if visit(i) {
+                            break;
+                        }
+                    }
+                    for i in (above..diff.len()).chain(0..below) {
+                        if visit(i) {
+                            break;
+                        }
+                    }
                 }
             }
         }
