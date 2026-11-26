@@ -322,6 +322,23 @@ where
         self.active_keys == 0
     }
 
+    /// Read `keys` from the page cache on the calling thread, returning `None` if any key's operation
+    /// is not cached.
+    ///
+    /// Unlike [Self::get_many], it never runs on the strategy or waits, so callers on any thread,
+    /// including another thread pool's workers, can try it before falling back to a read.
+    pub fn try_get_many_cached(
+        &self,
+        keys: &[impl Borrow<U::Key>],
+    ) -> Option<Vec<Option<U::Value>>> {
+        if keys.is_empty() {
+            return Some(Vec::new());
+        }
+        let (results, misses) =
+            resolve_cached(&self.snapshot, &self.log, keys, &|data: U, _| data.into_value(), 0);
+        misses.is_empty().then_some(results)
+    }
+
     /// Read into the page cache the active operations a batch's inactivity-floor walk reads
     /// first: the `count` active locations at or above the floor that follow the first `skip`.
     ///

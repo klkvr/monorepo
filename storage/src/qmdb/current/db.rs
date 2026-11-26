@@ -323,6 +323,15 @@ where
         self.any.get_metadata().await
     }
 
+    /// Read `keys` from the page cache on the calling thread, or `None` if any is not cached. See
+    /// `any::Db::try_get_many_cached`.
+    pub fn try_get_many_cached(
+        &self,
+        keys: &[impl Borrow<U::Key>],
+    ) -> Option<Vec<Option<U::Value>>> {
+        self.any.try_get_many_cached(keys)
+    }
+
     /// Read into the page cache the active operations a batch's inactivity-floor walk reads
     /// first, skipping the first `skip` of them. See `any::Db::prefetch_floor`.
     pub async fn prefetch_floor(&self, skip: usize, count: usize) -> Result<(), Error<F>> {
