@@ -851,6 +851,7 @@ where
     let batch_len = inner.journal_batch.items().len();
     let batch_base = *inner.bounds.tip.size - batch_len as u64;
 
+    let _phase = tracing::info_span!("qmdb.cl.overlay").entered();
     // Build chunk overlay: materialized bytes for every dirty chunk.
     let overlay = build_chunk_overlay::<F, U, _, N>(
         bitmap_parent,
@@ -860,6 +861,7 @@ where
         &inner.ancestor_diffs,
     );
 
+    drop(_phase);
     let grafting_height = grafting::height::<N>();
 
     // Merkleization reads ops-tree nodes only from memory. Graft roots of chunks the database has
@@ -893,6 +895,7 @@ where
         "invariant violated: pruned={pruned_chunks} graftable_parent={graftable_parent} graftable_overlay={graftable_overlay} new_complete={new_complete_chunks}"
     );
 
+    let _phase = tracing::info_span!("qmdb.cl.graft_inputs").entered();
     // Collect graft inputs for the chunks whose grafted leaf needs (re)computing:
     //   1) Dirty chunks (bits changed in this batch) already in the parent's grafted tree.
     //   2) Pending -> graftable transitions: chunks newly graftable because the ops tree built
@@ -919,6 +922,7 @@ where
         graft_inputs.push((idx, digest, chunk));
     }
 
+    drop(_phase);
     // Run graft hashing and the grafted batch's build and merkleization as one strategy job,
     // against a snapshot of the DB's grafted tree. An empty graft set hashes nothing, so it
     // merkleizes without submitting a job.
@@ -935,9 +939,11 @@ where
             graft_inputs,
             grafting_height,
         )
+        .instrument(tracing::info_span!("qmdb.cl.grafted_merkleize"))
         .await
     };
 
+    let _phase = tracing::info_span!("qmdb.cl.root").entered();
     // Build the layered bitmap (parent + overlay) before computing the canonical root, so that
     // the root witness sees newly completed chunks. Using bitmap_parent alone would miss chunks
     // that transitioned from partial to complete in this batch.

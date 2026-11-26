@@ -2609,6 +2609,7 @@ where
             prefetched,
         } = self;
 
+        let _phase = tracing::info_span!("qmdb.walk.gather").entered();
         // Resolve existing keys. Staged records already resolved their exact locations, so those
         // need no read. Other locations in their buckets still hold collision siblings.
         let mut locations = m.gather_existing_locations(&mutations, db);
@@ -2619,6 +2620,7 @@ where
             });
         }
 
+        drop(_phase);
         // Classify mutations into deleted, created, updated, collecting the successor and
         // predecessor candidates the link rewrites consult once they are sorted below.
         let mut neighbors: Neighbors<K, (Cow<'_, V::Value>, Location<F>)> = Neighbors::new();
@@ -2662,6 +2664,7 @@ where
             created.push((key, value, base_old_loc));
         }
 
+        let _phase = tracing::info_span!("qmdb.walk.prev_lookup").entered();
         // Look up prev_translated_key for created/deleted keys, including staged deletes.
         let mut prev_locations = Vec::new();
         for key in deleted
@@ -2689,6 +2692,7 @@ where
             });
         }
 
+        drop(_phase);
         // Those updates may precede the created and deleted keys, and their successors may
         // follow the created keys.
         let live = m
@@ -2702,6 +2706,7 @@ where
                 .push((update.key, Some((Cow::Owned(update.value), old_loc))));
         }
 
+        let _phase = tracing::info_span!("qmdb.walk.merge_sort").entered();
         // Merge staged-resolved records. They skip the journal re-read, and updates also skip the
         // index probe. Each record's cached successor feeds the successor candidates as the skipped
         // read would have. The cached successor is the key's successor at the parent's tip, because
@@ -2735,6 +2740,8 @@ where
         //
         // Each diff is key-sorted, as are `updated`/`created`/`deleted`, so the held check
         // advances three cursors in a sorted merge instead of three binary searches per key.
+        drop(_phase);
+        let _phase = tracing::info_span!("qmdb.walk.ancestor_scan").entered();
         let changes_membership = !created.is_empty() || !deleted.is_empty();
         if changes_membership {
             // Only the live neighbors of created and deleted keys can change an operation this
@@ -2809,6 +2816,8 @@ where
             }
         }
 
+        drop(_phase);
+        let _phase = tracing::info_span!("qmdb.walk.finish_neighbors").entered();
         // Resolved operations can still reference keys deleted by this batch. Only membership
         // changes consult the predecessor candidates.
         let is_deleted = |key: &K| deleted.binary_search_by(|(k, _)| k.cmp(key)).is_ok();
@@ -2817,6 +2826,8 @@ where
             neighbors.finish_prev(db.strategy(), is_deleted);
         }
 
+        drop(_phase);
+        let _phase = tracing::info_span!("qmdb.walk.emit").entered();
         // Generate operations.
         let mut walked = m.walked(deleted.len() + updated.len() + created.len());
 
@@ -2864,6 +2875,8 @@ where
             );
         }
 
+        drop(_phase);
+        let _phase = tracing::info_span!("qmdb.walk.claims").entered();
         // Update predecessors of created and deleted keys.
         if !neighbors.prev.is_empty() {
             // The create/delete ranges stay fixed as predecessor rewrites are appended.
@@ -2897,6 +2910,7 @@ where
             }
         }
 
+        drop(_phase);
         // Release the candidate keys and values before the remaining phases run.
         drop(neighbors);
 
