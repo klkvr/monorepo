@@ -17,6 +17,9 @@ use std::ops::Range;
 /// dozen entries at large key counts, so this covers a typical partition whole.
 const PREFETCH_LINES: usize = 8;
 
+/// The fewest entries a full partition grows by.
+const MIN_GROWTH: usize = 4;
+
 /// A single partition's values as sorted parallel arrays keyed by translated key.
 pub(super) struct Partition<K, V> {
     /// Translated keys in ascending order. Equal keys are adjacent (a value run).
@@ -144,8 +147,22 @@ impl<K: Ord + Copy, V> Partition<K, V> {
     /// Insert `(key, value)` at array index `idx`. The caller must pass an `idx` that keeps `keys`
     /// sorted (i.e. within or adjacent to `key`'s run).
     pub(super) fn insert_at(&mut self, idx: usize, key: K, value: V) {
+        // Grow a full partition by an eighth rather than doubling it: millions of partitions of a
+        // few dozen entries each would otherwise hold a third of their capacity unused.
+        if self.keys.len() == self.keys.capacity() {
+            self.keys.reserve_exact(Self::growth(self.keys.len()));
+        }
+        if self.vals.len() == self.vals.capacity() {
+            self.vals.reserve_exact(Self::growth(self.vals.len()));
+        }
         self.keys.insert(idx, key);
         self.vals.insert(idx, value);
+    }
+
+    /// The entries to add to a full partition of `len` entries.
+    const fn growth(len: usize) -> usize {
+        let eighth = len / 8;
+        if eighth > MIN_GROWTH { eighth } else { MIN_GROWTH }
     }
 
     /// Remove the entry at array index `idx`, returning its value.
