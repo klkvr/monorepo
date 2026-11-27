@@ -225,6 +225,54 @@ where
     inner: AnyStaged<F, H, U, S>,
     grafted_parent: Arc<merkle::batch::MerkleizedBatch<F, H::Digest, S>>,
     bitmap_parent: BitmapBatch<N>,
+    /// Grafted leaves hashed ahead of merkleize. See [`Staged::speculate_grafts`].
+    speculation: Option<PendingGraftSpeculation<F, H::Digest, S, N>>,
+}
+
+/// Grafted leaves hashed ahead of merkleize for the chunks a staged batch's writes are predicted
+/// to change. See [`Staged::speculate_grafts`].
+pub struct GraftSpeculation<F: Graftable, D: Digest, S: Strategy, const N: usize> {
+    grafted: merkle::batch::Prehashed<F, D, S>,
+    /// The predicted bytes of each chunk whose grafted leaf `grafted` holds.
+    chunks: AHashMap<usize, [u8; N]>,
+}
+
+/// A [`GraftSpeculation`] whose hashing may still run.
+pub struct PendingGraftSpeculation<F: Graftable, D: Digest, S: Strategy, const N: usize> {
+    grafted: core::pin::Pin<
+        Box<dyn core::future::Future<Output = merkle::batch::Prehashed<F, D, S>> + Send>,
+    >,
+    chunks: AHashMap<usize, [u8; N]>,
+}
+
+impl<F: Graftable, D: Digest, S: Strategy, const N: usize> GraftSpeculation<F, D, S, N> {
+    /// The number of chunks whose grafted leaves this speculation hashed.
+    #[cfg(test)]
+    pub(crate) fn predicted_chunks(&self) -> usize {
+        self.chunks.len()
+    }
+}
+
+impl<F: Graftable, D: Digest, S: Strategy, const N: usize> PendingGraftSpeculation<F, D, S, N> {
+    /// Waits for the hashing to finish.
+    pub async fn resolve(self) -> GraftSpeculation<F, D, S, N> {
+        GraftSpeculation {
+            grafted: self.grafted.await,
+            chunks: self.chunks,
+        }
+    }
+
+    /// Returns the speculation if its hashing has finished, or `self` to try again later.
+    pub fn try_resolve(mut self) -> Result<GraftSpeculation<F, D, S, N>, Self> {
+        let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+        match core::future::Future::poll(self.grafted.as_mut(), &mut cx) {
+            core::task::Poll::Ready(grafted) => Ok(GraftSpeculation {
+                grafted,
+                chunks: self.chunks,
+            }),
+            core::task::Poll::Pending => Err(self),
+        }
+    }
 }
 
 /// A speculative batch of operations whose root digest has been computed, in contrast to
@@ -358,6 +406,7 @@ where
                 inner,
                 grafted_parent,
                 bitmap_parent,
+                speculation: None,
             },
             values,
         ))
@@ -416,6 +465,7 @@ where
             inner,
             grafted_parent,
             bitmap_parent,
+            speculation,
         } = self;
         let (inner, range, values) = inner.expand(keys, &db.any).await?;
         Ok((
@@ -423,10 +473,109 @@ where
                 inner,
                 grafted_parent,
                 bitmap_parent,
+                speculation,
             },
             range,
             values,
         ))
+    }
+}
+
+impl<F, H, U, const N: usize, S: Strategy> Staged<F, H, U, N, S>
+where
+    F: Graftable,
+    U: update::Update,
+    H: Hasher,
+    Operation<F, U>: Codec,
+{
+    /// Start hashing, on the database's strategy, the grafted leaves of the chunks this batch's
+    /// staged reads change if each of them is written, so merkleize hashes only the chunks the
+    /// prediction got wrong. `previous`, an earlier speculation on this batch, is extended: only
+    /// chunks whose predicted bytes changed since are hashed.
+    ///
+    /// Hand the result to merkleize with [`Self::with_graft_speculation`]. Merkleize ignores a
+    /// speculation on another parent.
+    pub fn speculate_grafts<E, C, I>(
+        &self,
+        db: &super::db::Db<F, E, C, I, H, U, N, S>,
+        previous: Option<GraftSpeculation<F, H::Digest, S, N>>,
+    ) -> PendingGraftSpeculation<F, H::Digest, S, N>
+    where
+        E: Context,
+        C: Contiguous<Item = Operation<F, U>>,
+        I: UnorderedIndex<Value = Location<F>> + 'static,
+    {
+        let graftable = *self.grafted_parent.leaves() as usize;
+        let mut overlay = ChunkOverlay::new(
+            &self.bitmap_parent,
+            self.bitmap_parent.len(),
+            self.inner.len(),
+        );
+        for loc in self.inner.staged_locs() {
+            overlay.clear_bit(&self.bitmap_parent, *loc);
+        }
+        let previous =
+            previous.filter(|p| Arc::ptr_eq(&p.grafted.parent, &self.grafted_parent));
+        let mut chunks = AHashMap::with_capacity(overlay.chunks.len());
+        let mut inputs = Vec::new();
+        for (idx, chunk) in overlay.chunks {
+            // Only chunks the database grafted have their graft roots at hand; the few that only
+            // unapplied ancestors grafted are left to merkleize.
+            let Some(root) = (idx < graftable)
+                .then(|| db.graft_roots.get(idx))
+                .flatten()
+            else {
+                continue;
+            };
+            if previous.as_ref().and_then(|p| p.chunks.get(&idx)) != Some(&chunk) {
+                inputs.push((idx, root, chunk));
+            }
+            chunks.insert(idx, chunk);
+        }
+        let prehashed = previous.map(|previous| {
+            // Staged reads only grow, so this predicts every chunk `previous` did. Any it no
+            // longer predicts goes back to its parent bytes.
+            for &idx in previous.chunks.keys() {
+                if !chunks.contains_key(&idx)
+                    && let Some(root) = db.graft_roots.get(idx)
+                {
+                    inputs.push((idx, root, self.bitmap_parent.get_chunk(idx)));
+                }
+            }
+            previous.grafted
+        });
+        let grafted_tree = Arc::clone(&db.grafted_tree);
+        let parent = Arc::clone(&self.grafted_parent);
+        let grafted = db.strategy.clone().spawn(inputs.len(), move |strategy| {
+            let mut batch = parent.new_batch();
+            if let Some(prehashed) = prehashed {
+                batch = batch.with_prehashed(prehashed);
+            }
+            let ancestors = batch.retain_ancestors();
+            for (idx, digest) in grafting::grafted_leaf_digests::<H, _, N>(&strategy, inputs) {
+                batch = batch
+                    .update_leaf_digest(Location::<F>::new(idx as u64), digest)
+                    .expect("speculated chunks are grafted leaves");
+            }
+            let hasher = grafting::hasher::<F, H>(grafting::height::<N>());
+            let prehashed = batch.prehash(&grafted_tree, &hasher);
+            drop(ancestors);
+            prehashed
+        });
+        PendingGraftSpeculation {
+            grafted: Box::pin(grafted),
+            chunks,
+        }
+    }
+
+    /// Hand `speculation`, started by [`Self::speculate_grafts`], to merkleize, which then hashes
+    /// only the grafted leaves of the chunks it mispredicted.
+    pub fn with_graft_speculation(
+        mut self,
+        speculation: PendingGraftSpeculation<F, H::Digest, S, N>,
+    ) -> Self {
+        self.speculation = Some(speculation);
+        self
     }
 }
 
@@ -501,6 +650,7 @@ where
             inner,
             grafted_parent,
             bitmap_parent,
+            speculation,
         } = self;
         bitmap_parent.ensure_based_on(&db.any.bitmap)?;
 
@@ -510,7 +660,7 @@ where
         let inner = prepared
             .walk_floor_and_merkleize(staged, &bitmap_parent, policy)
             .await?;
-        compute_current_layer(inner, db, &grafted_parent, &bitmap_parent).await
+        compute_current_layer(inner, db, &grafted_parent, &bitmap_parent, speculation).await
     }
 }
 
@@ -585,6 +735,7 @@ where
             inner,
             grafted_parent,
             bitmap_parent,
+            speculation,
         } = self;
         bitmap_parent.ensure_based_on(&db.any.bitmap)?;
         let (inner, staged) = tracing::info_span!("qmdb.ordered.resolve")
@@ -595,7 +746,7 @@ where
             .walk_floor_and_merkleize(staged, &bitmap_parent, policy)
             .instrument(tracing::info_span!("qmdb.ordered.walk_and_merkleize"))
             .await?;
-        compute_current_layer(inner, db, &grafted_parent, &bitmap_parent)
+        compute_current_layer(inner, db, &grafted_parent, &bitmap_parent, speculation)
             .instrument(tracing::info_span!("qmdb.ordered.current_layer"))
             .await
     }
@@ -657,7 +808,7 @@ where
         let inner = prepared
             .walk_floor_and_merkleize(Vec::new(), &bitmap_parent, policy)
             .await?;
-        compute_current_layer(inner, db, &grafted_parent, &bitmap_parent).await
+        compute_current_layer(inner, db, &grafted_parent, &bitmap_parent, None).await
     }
 }
 
@@ -717,7 +868,7 @@ where
         let inner = prepared
             .walk_floor_and_merkleize(Vec::new(), &bitmap_parent, policy)
             .await?;
-        compute_current_layer(inner, db, &grafted_parent, &bitmap_parent).await
+        compute_current_layer(inner, db, &grafted_parent, &bitmap_parent, None).await
     }
 }
 
@@ -794,6 +945,7 @@ async fn merkleize_grafted_batch<F, H, S, const N: usize>(
     grafted_tree: &Arc<Mem<F, H::Digest>>,
     graft_inputs: Vec<(usize, H::Digest, [u8; N])>,
     grafting_height: u32,
+    prehashed: Option<merkle::batch::Prehashed<F, H::Digest, S>>,
 ) -> Arc<GenericMerkleizedBatch<F, H::Digest, S>>
 where
     F: Graftable,
@@ -802,6 +954,9 @@ where
 {
     let old_grafted_leaves = *grafted_parent.leaves() as usize;
     let mut grafted_batch = grafted_parent.new_batch();
+    if let Some(prehashed) = prehashed {
+        grafted_batch = grafted_batch.with_prehashed(prehashed);
+    }
     let ancestors = grafted_batch.retain_ancestors();
     let grafted_tree = Arc::clone(grafted_tree);
     strategy
@@ -837,6 +992,7 @@ async fn compute_current_layer<F, E, U, C, I, H, const N: usize, S>(
     db: &super::db::Db<F, E, C, I, H, U, N, S>,
     grafted_parent: &Arc<merkle::batch::MerkleizedBatch<F, H::Digest, S>>,
     bitmap_parent: &BitmapBatch<N>,
+    speculation: Option<PendingGraftSpeculation<F, H::Digest, S, N>>,
 ) -> Result<Arc<MerkleizedBatch<F, H::Digest, U, N, S>>, Error<F>>
 where
     F: Graftable,
@@ -907,6 +1063,37 @@ where
         .filter(|&(&idx, _)| idx < graftable_parent && idx >= pruned_chunks)
         .map(|(&idx, _)| idx)
         .collect();
+    // A speculation on the same parent already hashed the grafted leaves of the chunks it
+    // predicted: only chunks whose bytes differ from its prediction are hashed again, including
+    // predicted chunks this batch leaves at their parent bytes.
+    drop(_phase);
+    let speculation = match speculation {
+        Some(pending) => Some(
+            pending
+                .resolve()
+                .instrument(tracing::info_span!("qmdb.cl.speculation_wait"))
+                .await,
+        )
+        .filter(|s| Arc::ptr_eq(&s.grafted.parent, grafted_parent)),
+        None => None,
+    };
+    let _phase = tracing::info_span!("qmdb.cl.graft_inputs").entered();
+    let prehashed = speculation.map(|GraftSpeculation { grafted, chunks }| {
+        chunk_indices_to_update.retain(|idx| {
+            let chunk = overlay
+                .get(*idx)
+                .copied()
+                .unwrap_or_else(|| bitmap_parent.get_chunk(*idx));
+            chunks.get(idx) != Some(&chunk)
+        });
+        chunk_indices_to_update.extend(
+            chunks
+                .keys()
+                .copied()
+                .filter(|idx| !overlay.chunks.contains_key(idx)),
+        );
+        grafted
+    });
     chunk_indices_to_update.sort_unstable();
 
     // Newly graftable chunks come last, in ascending order, so they append to the grafted tree as
@@ -926,7 +1113,7 @@ where
     // Run graft hashing and the grafted batch's build and merkleization as one strategy job,
     // against a snapshot of the DB's grafted tree. An empty graft set hashes nothing, so it
     // merkleizes without submitting a job.
-    let grafted_batch = if graft_inputs.is_empty() {
+    let grafted_batch = if graft_inputs.is_empty() && prehashed.is_none() {
         let grafted_hasher = grafting::hasher::<F, H>(grafting_height);
         grafted_parent
             .new_batch()
@@ -938,6 +1125,7 @@ where
             &db.grafted_tree,
             graft_inputs,
             grafting_height,
+            prehashed,
         )
         .instrument(tracing::info_span!("qmdb.cl.grafted_merkleize"))
         .await
@@ -1483,6 +1671,7 @@ mod tests {
             &mem,
             graft_inputs(),
             grafting_height,
+            None,
         ));
         assert!(merkleize.as_mut().poll(&mut context).is_pending());
         drop(b);
@@ -1501,6 +1690,7 @@ mod tests {
             &mem,
             graft_inputs(),
             grafting_height,
+            None,
         ));
         assert!(merkleize.as_mut().poll(&mut context).is_pending());
         drop(merkleize);

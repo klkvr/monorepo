@@ -291,6 +291,15 @@ fn build_range<F: Family, D: Digest, Item: Write>(
     unhashed
 }
 
+/// Nodes hashed for leaf updates on `parent` without producing a batch, so a later batch on the same
+/// parent with more updates hashes only their paths. See [`UnmerkleizedBatch::with_prehashed`].
+pub(crate) struct Prehashed<F: Family, D: Digest, S: Strategy> {
+    /// The batch the nodes were hashed on.
+    pub(crate) parent: Arc<MerkleizedBatch<F, D, S>>,
+    /// The updated leaves and the internal nodes above them, by position.
+    nodes: Overwrites<F, D>,
+}
+
 /// A speculative batch whose root digest has not yet been computed,
 /// in contrast to [`MerkleizedBatch`].
 pub struct UnmerkleizedBatch<F: Family, D: Digest, S: Strategy> {
@@ -307,6 +316,9 @@ pub struct UnmerkleizedBatch<F: Family, D: Digest, S: Strategy> {
     add_many_start: Option<Location<F>>,
     /// Bit `i` is set if leaf `add_many_start + i` was updated.
     updated_new_leaves: BitMap,
+    /// Nodes a speculative hashing on the same parent computed, read after `overwrites` and
+    /// merged into it once the hash plan is built. See [`Self::with_prehashed`].
+    prehashed: Option<Overwrites<F, D>>,
 }
 
 impl<F: Family, D: Digest, S: Strategy> UnmerkleizedBatch<F, D, S> {
@@ -319,6 +331,7 @@ impl<F: Family, D: Digest, S: Strategy> UnmerkleizedBatch<F, D, S> {
             unhashed_nodes: Vec::new(),
             add_many_start: None,
             updated_new_leaves: BitMap::new(),
+            prehashed: None,
         }
     }
 
@@ -364,6 +377,9 @@ impl<F: Family, D: Digest, S: Strategy> UnmerkleizedBatch<F, D, S> {
             return self.appended.get(index).copied();
         }
         if let Some(d) = self.overwrites.get(&pos) {
+            return Some(*d);
+        }
+        if let Some(d) = self.prehashed.as_ref().and_then(|nodes| nodes.get(&pos)) {
             return Some(*d);
         }
         if let Some(d) = self.parent.get_node(pos) {
@@ -592,6 +608,62 @@ impl<F: Family, D: Digest, S: Strategy> UnmerkleizedBatch<F, D, S> {
         Ok(self)
     }
 
+    /// Start from `prehashed`, hashed for other leaf updates on this batch's parent: its leaves keep
+    /// their digests unless updated again here, and [`Self::merkleize`] hashes only the paths of
+    /// the leaves updated here.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `prehashed` was hashed on another parent, or if this batch has changes.
+    #[cfg(feature = "std")]
+    pub(crate) fn with_prehashed(mut self, prehashed: Prehashed<F, D, S>) -> Self {
+        assert!(
+            Arc::ptr_eq(&self.parent, &prehashed.parent),
+            "prehashed nodes belong to another parent"
+        );
+        assert!(
+            self.appended.is_empty() && self.overwrites.is_empty() && self.prehashed.is_none(),
+            "batch already has changes"
+        );
+        self.prehashed = Some(prehashed.nodes);
+        self
+    }
+
+    /// Hash this batch's dirty nodes as [`Self::merkleize`] does, but keep them as [`Prehashed`] nodes
+    /// for a later batch on the same parent instead of producing a batch.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this batch appended leaves.
+    #[cfg(feature = "std")]
+    pub(crate) fn prehash(
+        mut self,
+        base: &Mem<F, D>,
+        hasher: &impl Hasher<F, Digest = D>,
+    ) -> Prehashed<F, D, S> {
+        assert!(self.appended.is_empty(), "prehashed batches only update leaves");
+        let levels = self.hash_plan();
+        self.merge_prehashed();
+        for (height, positions) in levels.iter().enumerate() {
+            if !positions.is_empty() {
+                self.merkleize_level(base, hasher, positions, height as u32);
+            }
+        }
+        Prehashed {
+            parent: self.parent,
+            nodes: self.overwrites,
+        }
+    }
+
+    /// Move the prehashed nodes under this batch's own overwrites. Called once the hash plan has
+    /// read the updated leaves from `overwrites`.
+    fn merge_prehashed(&mut self) {
+        if let Some(mut nodes) = self.prehashed.take() {
+            nodes.extend(self.overwrites.drain());
+            self.overwrites = nodes;
+        }
+    }
+
     /// Consume this batch and produce an immutable [`MerkleizedBatch`] with computed dirty nodes.
     /// `base` provides committed node data as fallback during hash computation.
     ///
@@ -610,6 +682,7 @@ impl<F: Family, D: Digest, S: Strategy> UnmerkleizedBatch<F, D, S> {
         hasher: &impl Hasher<F, Digest = D>,
     ) -> Arc<MerkleizedBatch<F, D, S>> {
         let levels = self.hash_plan();
+        self.merge_prehashed();
 
         // Dirty nodes below the parent's size land in `overwrites`, so size it once instead of
         // rehashing as it grows.

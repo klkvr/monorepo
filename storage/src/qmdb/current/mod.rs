@@ -815,6 +815,45 @@ pub mod tests {
                             "expanded root mismatch at depth={depth}"
                         );
 
+                        // A graft speculation extended across an expansion must leave the root
+                        // unchanged, also when most staged reads are not written and so
+                        // mispredicted.
+                        let many: Vec<Digest> = (0..400u64).map(key).collect();
+                        for written_every in [1usize, 3] {
+                            let written = |i: usize| i % written_every == 0;
+                            let mut plain = new_batch();
+                            for (i, k) in many.iter().enumerate() {
+                                if written(i) {
+                                    plain = plain.write(*k, Some(val(i as u64 + 9_000)));
+                                }
+                            }
+                            let plain_root = plain.merkleize(&db).await.unwrap().root();
+                            let many_slots = (0..many.len())
+                                .map(|i| {
+                                    if written(i) {
+                                        Slot::Put(val(i as u64 + 9_000))
+                                    } else {
+                                        Slot::Keep
+                                    }
+                                })
+                                .collect();
+                            let (staged, _) = new_batch().stage(&many[..150], &db).await.unwrap();
+                            let first = staged.speculate_grafts(&db, None).resolve().await;
+                            assert!(first.predicted_chunks() > 0, "no chunk was speculated");
+                            let (staged, _, _) = staged.expand(&many[150..], &db).await.unwrap();
+                            let pending = staged.speculate_grafts(&db, Some(first));
+                            let speculated_root = staged
+                                .with_graft_speculation(pending)
+                                .merkleize(many_slots, Vec::new(), &db)
+                                .await
+                                .unwrap()
+                                .root();
+                            assert_eq!(
+                                plain_root, speculated_root,
+                                "speculated root mismatch at depth={depth} written_every={written_every}"
+                            );
+                        }
+
                         let planned = val(7_000);
                         let duplicate_update = val(7_001);
                         let (staged, first_values) =

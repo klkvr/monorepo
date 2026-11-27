@@ -59,7 +59,7 @@ pub(super) struct GraftRoots<D> {
 }
 
 impl<D: Copy> GraftRoots<D> {
-    fn get(&self, chunk: usize) -> Option<D> {
+    pub(super) fn get(&self, chunk: usize) -> Option<D> {
         self.roots.get(chunk.checked_sub(self.start)?).copied()
     }
 
