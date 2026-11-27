@@ -1047,6 +1047,7 @@ where
         let remaining = usize::try_from((*last).saturating_sub(**scan)).unwrap_or(usize::MAX);
         let mut candidates = Vec::with_capacity(need.min(hint).min(remaining));
         let mut inactive_at = inactive.partition_point(|loc| *loc < *scan);
+        let fill = tracing::info_span!("qmdb.floor.fill").entered();
         while candidates.len() < need && *scan < last {
             let kept = candidates.len();
             let next = source.fill(*scan, *last, need, &mut candidates);
@@ -1077,10 +1078,18 @@ where
             candidates.truncate(write);
         }
 
+        drop(fill);
+
         // Read the committed candidates in one batch.
         let split = candidates.partition_point(|loc| *loc < self.db_state.size);
         let positions: Vec<u64> = candidates[..split].iter().map(|loc| **loc).collect();
-        let committed = log.read_many_sharded(&positions).await?;
+        let committed = log
+            .read_many_sharded(&positions)
+            .instrument(tracing::info_span!(
+                "qmdb.floor.read",
+                candidates = positions.len() as u64
+            ))
+            .await?;
         Ok(Round {
             candidates,
             committed,
@@ -1344,9 +1353,12 @@ where
             // Classification is the first consumer of the sorted diff. By now the sort has
             // overlapped the fill and read above.
             if let Some(job) = diff_sort.take() {
-                walked.diff = job.await;
+                walked.diff = job
+                    .instrument(tracing::info_span!("qmdb.floor.sort_wait"))
+                    .await;
             }
 
+            let classify = tracing::info_span!("qmdb.floor.classify").entered();
             // Classify each candidate, as a [`Move`], against the state after the writes. A
             // Commit has no key and is inactive.
             let diff = &walked.diff;
@@ -1370,6 +1382,8 @@ where
                 );
             }
 
+            drop(classify);
+            let _decide = tracing::info_span!("qmdb.floor.decide").entered();
             // Reach each active candidate in order, moving committed operations out of the read
             // and cloning in-memory ones.
             let mut reads = round.committed.into_iter().flatten();
