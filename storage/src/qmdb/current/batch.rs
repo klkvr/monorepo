@@ -1078,7 +1078,13 @@ where
         None => None,
     };
     let _phase = tracing::info_span!("qmdb.cl.graft_inputs").entered();
+    let dirty = chunk_indices_to_update.len();
     let prehashed = speculation.map(|GraftSpeculation { grafted, chunks }| {
+        let predicted = chunks.len();
+        let unpredicted = chunk_indices_to_update
+            .iter()
+            .filter(|idx| !chunks.contains_key(*idx))
+            .count();
         chunk_indices_to_update.retain(|idx| {
             let chunk = overlay
                 .get(*idx)
@@ -1092,6 +1098,14 @@ where
                 .copied()
                 .filter(|idx| !overlay.chunks.contains_key(idx)),
         );
+        tracing::info_span!(
+            "qmdb.cl.speculation_reuse",
+            dirty = dirty as u64,
+            predicted = predicted as u64,
+            unpredicted = unpredicted as u64,
+            rehashed = chunk_indices_to_update.len() as u64,
+        )
+        .in_scope(|| {});
         grafted
     });
     chunk_indices_to_update.sort_unstable();
