@@ -1029,13 +1029,18 @@ where
 
     let _phase = tracing::info_span!("qmdb.cl.overlay").entered();
     // Build chunk overlay: materialized bytes for every dirty chunk.
-    let overlay = build_chunk_overlay::<F, U, _, N>(
-        bitmap_parent,
-        batch_len,
-        batch_base,
-        &inner.diff,
-        &inner.ancestor_diffs,
-    );
+    // One read lock for every chunk the overlay materializes, rather than one per chunk. The
+    // guard stays in this block: it is not Send, so it must not live across an await.
+    let overlay = {
+        let locked = bitmap_parent.locked();
+        build_chunk_overlay::<F, U, _, N>(
+            &locked,
+            batch_len,
+            batch_base,
+            &inner.diff,
+            &inner.ancestor_diffs,
+        )
+    };
 
     drop(_phase);
     let grafting_height = grafting::height::<N>();
@@ -1276,6 +1281,71 @@ impl<const N: usize> BitmapBatch<N> {
             }));
         }
         result
+    }
+}
+
+/// A [`BitmapBatch`] chain read under one hold of the database bitmap's read lock.
+pub(crate) struct LockedBitmapBatch<'a, const N: usize> {
+    /// The chain's overlays, nearest first.
+    overlays: Vec<&'a ChunkOverlay<N>>,
+    base: commonware_utils::sync::RwLockReadGuard<'a, bitmap::Prunable<N>>,
+    len: u64,
+}
+
+impl<const N: usize> BitmapBatch<N> {
+    /// Read the chain under one hold of the shared bitmap's read lock, for many chunk reads.
+    /// Only the database's own actor writes the bitmap, never while it reads.
+    pub(crate) fn locked(&self) -> LockedBitmapBatch<'_, N> {
+        let mut overlays = Vec::new();
+        let mut current = self;
+        while let Self::Layer(layer) = current {
+            overlays.push(layer.overlay.as_ref());
+            current = &layer.parent;
+        }
+        LockedBitmapBatch {
+            overlays,
+            base: self.shared().read(),
+            len: self.len(),
+        }
+    }
+}
+
+impl<const N: usize> bitmap::Readable<N> for LockedBitmapBatch<'_, N> {
+    fn complete_chunks(&self) -> usize {
+        (self.len / bitmap::Prunable::<N>::CHUNK_SIZE_BITS) as usize
+    }
+
+    fn get_chunk(&self, idx: usize) -> [u8; N] {
+        for overlay in &self.overlays {
+            if let Some(&chunk) = overlay.get(idx) {
+                return chunk;
+            }
+        }
+        *self.base.get_chunk(idx)
+    }
+
+    fn last_chunk(&self) -> ([u8; N], u64) {
+        let total = self.len;
+        if total == 0 {
+            return (bitmap::BitMap::<N>::EMPTY_CHUNK, 0);
+        }
+        let bits = bitmap::Prunable::<N>::CHUNK_SIZE_BITS;
+        let rem = total % bits;
+        let bits_in_last = if rem == 0 { bits } else { rem };
+        let idx = if rem == 0 {
+            self.complete_chunks().saturating_sub(1)
+        } else {
+            self.complete_chunks()
+        };
+        (self.get_chunk(idx), bits_in_last)
+    }
+
+    fn pruned_chunks(&self) -> usize {
+        self.base.pruned_chunks()
+    }
+
+    fn len(&self) -> u64 {
+        self.len
     }
 }
 

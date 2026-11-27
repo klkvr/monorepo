@@ -207,12 +207,56 @@ impl<F: Family, V> DiffEntry<F, V> {
     }
 }
 
-/// Binary-search `entries` for `key`. `entries` must be sorted by key with no duplicates.
+/// Binary-search entries for key. Entries must be sorted by key with no duplicates.
 pub(crate) fn lookup_sorted<'a, K: Ord, V>(entries: &'a [(K, V)], key: &K) -> Option<&'a V> {
     entries
         .binary_search_by(|(candidate, _)| candidate.cmp(key))
         .ok()
         .map(|idx| &entries[idx].1)
+}
+
+/// Search `entries` for `key`. `entries` must be sorted by key with no duplicates.
+///
+/// A few interpolation probes on the keys' leading bytes narrow the range before a binary search
+/// finishes it. Keys are usually hashes, so the probes land within a few entries of the key; for
+/// other keys they cost a few extra comparisons. Every step compares keys with Ord, so the result
+/// never depends on how the bytes are distributed.
+pub(crate) fn lookup_hashed<'a, K: Ord + AsRef<[u8]>, V>(
+    entries: &'a [(K, V)],
+    key: &K,
+) -> Option<&'a V> {
+    let (mut lo, mut hi) = (0, entries.len());
+    let target = key_prefix(key.as_ref());
+    for _ in 0..3 {
+        if hi - lo < 16 {
+            break;
+        }
+        let first = key_prefix(entries[lo].0.as_ref());
+        let last = key_prefix(entries[hi - 1].0.as_ref());
+        if target <= first || target >= last {
+            break;
+        }
+        let span = (hi - lo - 1) as u128;
+        let pos = lo + ((u128::from(target - first) * span) / u128::from(last - first)) as usize;
+        match entries[pos].0.cmp(key) {
+            core::cmp::Ordering::Equal => return Some(&entries[pos].1),
+            core::cmp::Ordering::Less => lo = pos + 1,
+            core::cmp::Ordering::Greater => hi = pos,
+        }
+    }
+    entries[lo..hi]
+        .binary_search_by(|(candidate, _)| candidate.cmp(key))
+        .ok()
+        .map(|idx| &entries[lo + idx].1)
+}
+
+/// The first eight bytes of a key as a big-endian integer, zero-padded, which orders like the
+/// bytes.
+fn key_prefix(bytes: &[u8]) -> u64 {
+    let mut prefix = [0u8; 8];
+    let len = bytes.len().min(8);
+    prefix[..len].copy_from_slice(&bytes[..len]);
+    u64::from_be_bytes(prefix)
 }
 
 /// Returns the number of leading items of `items` that `below` holds for, searching outward from
@@ -607,7 +651,7 @@ fn resolve_in_ancestors<'a, F: Family, D: Digest, U: update::Update, S: Strategy
     key: &U::Key,
 ) -> Option<&'a DiffEntry<F, U::Value>> {
     for batch in ancestors {
-        if let Some(entry) = lookup_sorted(batch.diff.as_slice(), key) {
+        if let Some(entry) = lookup_hashed(batch.diff.as_slice(), key) {
             return Some(entry);
         }
     }
@@ -684,9 +728,8 @@ impl<'a, K: Ord, F: Family, V> DiffCursors<'a, K, F, V> {
                 *cursor == 0 || diff[*cursor - 1].0 < *key,
                 "queries must be non-decreasing"
             );
-            while *cursor < diff.len() && diff[*cursor].0 < *key {
-                *cursor += 1;
-            }
+            // Gallop from the cursor: sparse queries skip far ahead, dense ones step by one.
+            *cursor = partition_from(diff, *cursor, |(k, _)| k < key);
             if let Some((k, entry)) = diff.get(*cursor)
                 && k == key
             {
@@ -743,7 +786,7 @@ fn resolve_pending_from_diffs<'a, K, F: Family, V: Clone + Send + Sync + 'a, S: 
     results: &mut [Option<V>],
     mut on_hit: impl FnMut(usize, &DiffEntry<F, V>),
 ) where
-    K: Ord + Sync,
+    K: Ord + Sync + AsRef<[u8]>,
 {
     if pending.is_empty() || diffs.is_empty() {
         return;
@@ -755,7 +798,7 @@ fn resolve_pending_from_diffs<'a, K, F: Family, V: Clone + Send + Sync + 'a, S: 
             .filter_map(|(slot, key)| {
                 diffs
                     .iter()
-                    .find_map(|diff| lookup_sorted(diff, key))
+                    .find_map(|diff| lookup_hashed(diff, key))
                     .map(|entry| (*slot, entry))
             })
             .collect()
@@ -785,7 +828,7 @@ fn resolve_reads<'a, K, F: Family, V, S: Strategy>(
     on_diff_hit: impl FnMut(usize, &DiffEntry<F, V>),
 ) -> UncommittedReadResolution<'a, K, V>
 where
-    K: Ord + Sync,
+    K: Ord + Sync + AsRef<[u8]>,
     V: Clone + Send + Sync,
 {
     let mut results = vec![None; keys.len()];
@@ -8875,12 +8918,14 @@ pub(crate) mod tests {
             base_old_loc: None,
         };
         let deleted = || DiffEntry::<mmr::Family, u64>::Deleted { base_old_loc: None };
-        let near = vec![(1u64, deleted()), (2, active(20)), (5, active(50))];
+        // Byte keys, which order like the numbers, as lookups probe the keys' leading bytes.
+        let k = |n: u64| n.to_be_bytes();
+        let near = vec![(k(1), deleted()), (k(2), active(20)), (k(5), active(50))];
         let far = vec![
-            (1u64, active(10)),
-            (2, active(200)),
-            (3, active(30)),
-            (8, deleted()),
+            (k(1), active(10)),
+            (k(2), active(200)),
+            (k(3), active(30)),
+            (k(8), deleted()),
         ];
         let expected = |key: u64| match key {
             1 | 8 => Some(None),
@@ -8891,9 +8936,9 @@ pub(crate) mod tests {
         };
 
         // Pending reads occupy the odd slots, so the even ones must come back untouched.
-        let keys = [9u64, 1, 2, 1, 4, 0, 8, 3, 9, 5, 6];
+        let keys = [9u64, 1, 2, 1, 4, 0, 8, 3, 9, 5, 6].map(k);
         for len in [0, 1, 2, 3, 7, 11] {
-            let pending: Vec<PendingRead<'_, u64>> = keys[..len]
+            let pending: Vec<PendingRead<'_, [u8; 8]>> = keys[..len]
                 .iter()
                 .enumerate()
                 .map(|(i, key)| (2 * i + 1, key))
@@ -8912,7 +8957,7 @@ pub(crate) mod tests {
 
             let mut expected_hits = Vec::new();
             for (slot, key) in &pending {
-                let value = expected(**key);
+                let value = expected(u64::from_be_bytes(**key));
                 assert_eq!(
                     resolved[*slot],
                     value.is_some(),
