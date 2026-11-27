@@ -568,6 +568,26 @@ where
         }
     }
 
+    /// The locations of the `count` active operations that follow the first `skip` at or above the
+    /// staged-on state's inactivity floor: the floor walk's first candidates. Reading them with
+    /// [`Db::prefetch_ops`](super::db::Db::prefetch_ops) while the block executes keeps the walk
+    /// off the disk.
+    pub fn floor_candidates(&self, skip: usize, count: usize) -> Vec<u64> {
+        use crate::qmdb::bitmap::Candidates as _;
+        let Some(limit) = skip.checked_add(count).filter(|_| count > 0) else {
+            return Vec::new();
+        };
+        let mut candidates = Vec::with_capacity(limit);
+        let mut source = &self.bitmap_parent;
+        source.fill(
+            self.inner.inactivity_floor(),
+            self.bitmap_parent.len(),
+            limit,
+            &mut candidates,
+        );
+        candidates.iter().skip(skip).map(|loc| **loc).collect()
+    }
+
     /// Hand `speculation`, started by [`Self::speculate_grafts`], to merkleize, which then hashes
     /// only the grafted leaves of the chunks it mispredicted.
     pub fn with_graft_speculation(

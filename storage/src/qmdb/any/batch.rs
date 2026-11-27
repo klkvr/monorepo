@@ -1593,6 +1593,11 @@ where
         self.keys.len()
     }
 
+    /// The inactivity floor of the state the reads were staged on.
+    pub(crate) fn inactivity_floor(&self) -> Location<F> {
+        self.batch.base.inactivity_floor()
+    }
+
     /// The locations the staged reads resolved to, for the keys that exist.
     pub(crate) fn staged_locs(&self) -> impl Iterator<Item = Location<F>> + '_ {
         self.resolutions.iter().flatten().map(|(loc, _)| loc.loc())

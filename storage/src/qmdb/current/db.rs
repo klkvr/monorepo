@@ -338,6 +338,17 @@ where
         self.any.prefetch_floor(skip, count).await
     }
 
+    /// Read the operations at `locations`, sorted, into the page cache, skipping those the log does
+    /// not hold yet. Changes nothing.
+    pub async fn prefetch_ops(&self, locations: &[u64]) -> Result<(), Error<F>> {
+        let size = *self.any.log.size();
+        let positions: Vec<u64> = locations.iter().copied().filter(|loc| *loc < size).collect();
+        if !positions.is_empty() {
+            self.any.log.read_many(&positions).await?;
+        }
+        Ok(())
+    }
+
     /// Batch read multiple keys, returning results in the same order as the input keys.
     pub async fn get_many(
         &self,
