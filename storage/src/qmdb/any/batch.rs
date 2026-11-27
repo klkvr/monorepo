@@ -215,6 +215,31 @@ pub(crate) fn lookup_sorted<'a, K: Ord, V>(entries: &'a [(K, V)], key: &K) -> Op
         .map(|idx| &entries[idx].1)
 }
 
+/// Returns the number of leading items of `items` that `below` holds for, searching outward from
+/// `hint`: `below` must hold for a prefix of `items`. Costs the logarithm of the distance from
+/// `hint` rather than of the length, for lookups near an earlier one.
+fn partition_from<T>(items: &[T], hint: usize, below: impl Fn(&T) -> bool) -> usize {
+    let hint = hint.min(items.len());
+    let mut step = 1;
+    if hint < items.len() && below(&items[hint]) {
+        let mut lo = hint + 1;
+        while lo + step <= items.len() && below(&items[lo + step - 1]) {
+            lo += step;
+            step *= 2;
+        }
+        let hi = (lo + step).min(items.len());
+        lo + items[lo..hi].partition_point(below)
+    } else {
+        let mut hi = hint;
+        while hi >= step && !below(&items[hi - step]) {
+            hi -= step;
+            step *= 2;
+        }
+        let lo = hi.saturating_sub(step);
+        lo + items[lo..hi].partition_point(below)
+    }
+}
+
 /// Returns whether `items`, sorted and unique by `key`, holds an item keyed `target`, advancing
 /// `cursor` past items keyed below it. Successive calls must use non-decreasing `target`s.
 fn sorted_contains_by<T, Q: Ord>(
@@ -2758,37 +2783,47 @@ where
                 .chain(created.iter().map(|(k, ..)| k))
                 .collect();
             changed.sort_unstable();
-            let written = |key: &K| -> Option<bool> {
-                if updated.binary_search_by(|(k, ..)| k.cmp(key)).is_ok()
-                    || created.binary_search_by(|(k, ..)| k.cmp(key)).is_ok()
-                {
-                    Some(true)
-                } else if deleted.binary_search_by(|(k, _)| k.cmp(key)).is_ok() {
-                    Some(false)
-                } else {
-                    None
-                }
-            };
+            // Changed keys are visited in order, so cursors into each ancestor diff and into
+            // `updated`, `created` and `deleted` advance with them, and the keys a scan meets, near
+            // the changed key, are found by galloping from those cursors.
+            let diffs: Vec<_> = m.ancestors.iter().map(|a| a.diff.as_slice()).collect();
+            let mut at = vec![0usize; diffs.len()];
+            let (mut at_u, mut at_c, mut at_d) = (0, 0, 0);
             let mut seen: AHashSet<&K> = AHashSet::new();
-            for (depth, batch) in m.ancestors.iter().enumerate() {
-                let diff = batch.diff.as_slice();
-                let nearer = &m.ancestors[..depth];
-                let mut visit = |i: usize| -> bool {
-                    let (key, entry) = &diff[i];
-                    if let Some(live) = written(key) {
-                        return live;
+            for &key in &changed {
+                for (d, diff) in diffs.iter().enumerate() {
+                    at[d] = partition_from(diff, at[d], |(k, _)| k < key);
+                }
+                at_u = partition_from(&updated, at_u, |(k, ..)| k < key);
+                at_c = partition_from(&created, at_c, |(k, ..)| k < key);
+                at_d = partition_from(&deleted, at_d, |(k, _)| k < key);
+                let mut visit = |d: usize, i: usize| -> bool {
+                    let (k, entry) = &diffs[d][i];
+                    let u = partition_from(&updated, at_u, |(x, ..)| x < k);
+                    if updated.get(u).is_some_and(|(x, ..)| x == k) {
+                        return true;
                     }
-                    if let Some(newer) = nearer
-                        .iter()
-                        .find_map(|a| lookup_sorted(a.diff.as_slice(), key))
-                    {
-                        return newer.loc().is_some();
+                    let c = partition_from(&created, at_c, |(x, ..)| x < k);
+                    if created.get(c).is_some_and(|(x, ..)| x == k) {
+                        return true;
+                    }
+                    let x = partition_from(&deleted, at_d, |(x, _)| x < k);
+                    if deleted.get(x).is_some_and(|(x, _)| x == k) {
+                        return false;
+                    }
+                    for (n, nearer) in diffs[..d].iter().enumerate() {
+                        let idx = partition_from(nearer, at[n], |(x, _)| x < k);
+                        if let Some((x, newer)) = nearer.get(idx)
+                            && x == k
+                        {
+                            return newer.loc().is_some();
+                        }
                     }
                     let Some(loc) = entry.loc() else {
                         return false;
                     };
-                    if seen.insert(key) {
-                        let data = batch.update_at(loc);
+                    if seen.insert(k) {
+                        let data = m.ancestors[d].update_at(loc);
                         neighbors.next.push(data.key.clone());
                         neighbors.next.push(data.next_key.clone());
                         neighbors
@@ -2797,18 +2832,18 @@ where
                     }
                     true
                 };
-                for &key in &changed {
-                    let below = diff.partition_point(|(k, _)| k < key);
+                for (d, diff) in diffs.iter().enumerate() {
+                    let below = at[d];
                     let above = below + usize::from(diff.get(below).is_some_and(|(k, _)| k == key));
                     // Keys form a cycle, the last key's next key being the first, so each scan
                     // wraps around the diff's ends.
                     for i in (0..below).rev().chain((above..diff.len()).rev()) {
-                        if visit(i) {
+                        if visit(d, i) {
                             break;
                         }
                     }
                     for i in (above..diff.len()).chain(0..below) {
-                        if visit(i) {
+                        if visit(d, i) {
                             break;
                         }
                     }
