@@ -2813,7 +2813,10 @@ where
             let diffs: Vec<_> = m.ancestors.iter().map(|a| a.diff.as_slice()).collect();
             let mut at = vec![0usize; diffs.len()];
             let (mut at_u, mut at_c, mut at_d) = (0, 0, 0);
-            let mut seen: AHashSet<&K> = AHashSet::new();
+            // Only the nearest live key on each side of a changed key matters, so each diff's
+            // scan yields its first live key per side and the nearest across diffs is pushed. A
+            // key pushed again for a later changed key is dropped when the lists are finished.
+            let mut last_pushed: Option<&K> = None;
             for &key in &changed {
                 for (d, diff) in diffs.iter().enumerate() {
                     at[d] = partition_from(diff, at[d], |(k, _)| k < key);
@@ -2821,56 +2824,76 @@ where
                 at_u = partition_from(&updated, at_u, |(k, ..)| k < key);
                 at_c = partition_from(&created, at_c, |(k, ..)| k < key);
                 at_d = partition_from(&deleted, at_d, |(k, _)| k < key);
-                let mut visit = |d: usize, i: usize| -> bool {
+                // Whether the key at `diffs[d][i]` is live, and if so the ancestor and location of
+                // its newest active entry, or `None` when this batch writes it.
+                let visit = |d: usize, i: usize| -> Option<Option<(usize, Location<F>)>> {
                     let (k, entry) = &diffs[d][i];
                     let u = partition_from(&updated, at_u, |(x, ..)| x < k);
                     if updated.get(u).is_some_and(|(x, ..)| x == k) {
-                        return true;
+                        return Some(None);
                     }
                     let c = partition_from(&created, at_c, |(x, ..)| x < k);
                     if created.get(c).is_some_and(|(x, ..)| x == k) {
-                        return true;
+                        return Some(None);
                     }
                     let x = partition_from(&deleted, at_d, |(x, _)| x < k);
                     if deleted.get(x).is_some_and(|(x, _)| x == k) {
-                        return false;
+                        return None;
                     }
                     for (n, nearer) in diffs[..d].iter().enumerate() {
                         let idx = partition_from(nearer, at[n], |(x, _)| x < k);
                         if let Some((x, newer)) = nearer.get(idx)
                             && x == k
                         {
-                            return newer.loc().is_some();
+                            return newer.loc().map(|loc| Some((n, loc)));
                         }
                     }
-                    let Some(loc) = entry.loc() else {
-                        return false;
-                    };
-                    if seen.insert(k) {
-                        let data = m.ancestors[d].update_at(loc);
-                        neighbors.next.push(data.key.clone());
-                        neighbors.next.push(data.next_key.clone());
-                        neighbors
-                            .prev
-                            .push((data.key.clone(), Some((Cow::Borrowed(&data.value), loc))));
-                    }
-                    true
+                    entry.loc().map(|loc| Some((d, loc)))
                 };
+                // Per side, the nearest live key: one reached without wrapping around the key
+                // cycle beats one reached by wrapping, then the closer key wins.
+                let mut below_best: Option<(bool, &K, Option<(usize, Location<F>)>)> = None;
+                let mut above_best: Option<(bool, &K, Option<(usize, Location<F>)>)> = None;
                 for (d, diff) in diffs.iter().enumerate() {
                     let below = at[d];
                     let above = below + usize::from(diff.get(below).is_some_and(|(k, _)| k == key));
                     // Keys form a cycle, the last key's next key being the first, so each scan
                     // wraps around the diff's ends.
                     for i in (0..below).rev().chain((above..diff.len()).rev()) {
-                        if visit(d, i) {
+                        if let Some(source) = visit(d, i) {
+                            let found = (i >= above, &diff[i].0, source);
+                            if below_best.is_none_or(|(wrapped, k, _)| {
+                                (found.0, core::cmp::Reverse(found.1)) < (wrapped, core::cmp::Reverse(k))
+                            }) {
+                                below_best = Some(found);
+                            }
                             break;
                         }
                     }
                     for i in (above..diff.len()).chain(0..below) {
-                        if visit(d, i) {
+                        if let Some(source) = visit(d, i) {
+                            let found = (i < below, &diff[i].0, source);
+                            if above_best.is_none_or(|(wrapped, k, _)| (found.0, found.1) < (wrapped, k)) {
+                                above_best = Some(found);
+                            }
                             break;
                         }
                     }
+                }
+                for (_, k, source) in [below_best, above_best].into_iter().flatten() {
+                    let Some((d, loc)) = source else {
+                        continue;
+                    };
+                    if last_pushed == Some(k) {
+                        continue;
+                    }
+                    last_pushed = Some(k);
+                    let data = m.ancestors[d].update_at(loc);
+                    neighbors.next.push(data.key.clone());
+                    neighbors.next.push(data.next_key.clone());
+                    neighbors
+                        .prev
+                        .push((data.key.clone(), Some((Cow::Borrowed(&data.value), loc))));
                 }
             }
         }
